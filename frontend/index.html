@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Veritas | AI Fact Checker</title>
+
   <style>
     :root {
       --bg: #0f172a;
@@ -14,9 +15,9 @@
       --fake: #ef4444;
       --uncertain: #f59e0b;
     }
-    
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background-color: var(--bg);
@@ -63,7 +64,6 @@
       border-radius: 8px;
       font-weight: bold;
       cursor: pointer;
-      transition: background 0.2s;
     }
 
     button:hover { background-color: #2563eb; }
@@ -83,7 +83,6 @@
     .result-card h2 {
       margin-bottom: 10px;
       display: flex;
-      align-items: center;
       justify-content: space-between;
     }
 
@@ -116,29 +115,47 @@
       margin-bottom: 10px;
       font-size: 1.1rem;
     }
+
+    /* 📱 MOBILE FIX (IMPORTANT) */
+    @media (max-width: 600px) {
+      .input-group {
+        flex-direction: column;
+      }
+
+      button {
+        width: 100%;
+      }
+    }
   </style>
 </head>
+
 <body>
   <div class="container">
     <h1>Veritas | AI Fact Checker</h1>
+
     <div class="input-group">
       <textarea id="newsInput" placeholder="Paste a news claim or article here..."></textarea>
       <button onclick="checkNews()" id="checkBtn">Verify</button>
     </div>
+
     <div id="result"></div>
   </div>
 
   <script>
     async function checkNews() {
-      const text = document.getElementById("newsInput").value;
+      const text = document.getElementById("newsInput").value.trim();
       const resultDiv = document.getElementById("result");
       const btn = document.getElementById("checkBtn");
 
-      if (!text) return;
+      if (!text) {
+        alert("Enter some text");
+        return;
+      }
 
       btn.innerText = "Checking...";
       btn.disabled = true;
-      resultDiv.innerHTML = "<p style='text-align:center;'>Analyzing across news sources...</p>";
+
+      resultDiv.innerHTML = "<p style='text-align:center;'>Analyzing...</p>";
 
       try {
         const res = await fetch("https://workbysaksham.onrender.com/check-news", {
@@ -147,46 +164,43 @@
           body: JSON.stringify({ text })
         });
 
-        if (!res.ok) throw new Error("Server response was not ok.");
-        
         const data = await res.json();
 
         let sourcesHTML = "";
+
         if (data.sources && data.sources.length > 0) {
-          const links = data.sources.map(s => 
-            `<a href="${s.url}" target="_blank" class="source-item">
-              ${s.title} <span>Source: ${s.source}</span>
-            </a>`
-          ).join("");
-          
           sourcesHTML = `
-            <div class="sources-title">Verified Sources Referenced:</div>
-            <div class="source-list">${links}</div>
+            <div class="sources-title">Sources:</div>
+            <div class="source-list">
+              ${data.sources.map(s => `
+                <a href="${s.url}" target="_blank" class="source-item">
+                  ${s.title}
+                  <span>${s.source || "Unknown"}</span>
+                </a>
+              `).join("")}
+            </div>
           `;
-        } else {
-          sourcesHTML = `<div class="sources-title">No direct news links available for this specific query.</div>`;
         }
 
         resultDiv.innerHTML = `
           <div class="result-card status-${data.label}">
-            <h2>${data.label} <span style="font-size: 1rem; color: #94a3b8;">(${data.confidence} Confidence)</span></h2>
+            <h2>${data.label} <span>(${data.confidence})</span></h2>
             <p>${data.reason}</p>
             ${sourcesHTML}
           </div>
         `;
 
-      } catch (error) {
-        console.error("Fetch error:", error);
+      } catch (err) {
         resultDiv.innerHTML = `
           <div class="result-card status-Fake">
-            <h2>Connection Error</h2>
-            <p>Could not reach the backend server. Make sure it is running and the URL is correct.</p>
+            <h2>Error</h2>
+            <p>Server not reachable</p>
           </div>
         `;
-      } finally {
-        btn.innerText = "Verify";
-        btn.disabled = false;
       }
+
+      btn.innerText = "Verify";
+      btn.disabled = false;
     }
   </script>
 </body>
