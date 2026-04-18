@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
@@ -12,46 +13,44 @@ app.use(express.json());
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// ❗ Safety check (prevents silent crashes)
+// Safety check
 if (!NEWS_API_KEY || !GEMINI_API_KEY) {
-  console.error("❌ Missing API keys in environment variables");
+  console.error("❌ Missing API keys");
 }
 
-// ✅ Gemini setup
+// Gemini setup
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model: "gemini-1.5-flash",
-  generationConfig: {
-    temperature: 0.3,
-  }
+  model: "gemini-1.5-flash"
 });
 
-// 🔍 Clean query
+// Clean input
 function cleanQuery(text) {
   return text
     .replace(/[^a-zA-Z0-9 ]/g, "")
     .split(" ")
-    .filter(w => w.length > 2)
     .slice(0, 6)
     .join(" ");
 }
 
-// 📰 Fetch news
+// Fetch news
 async function fetchNews(query) {
   try {
     const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&apiKey=${NEWS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
 
-    if (data.status === "ok") return data.articles.slice(0, 5);
+    if (data.status === "ok") {
+      return data.articles.slice(0, 5);
+    }
     return [];
   } catch (err) {
-    console.log("NEWS ERROR:", err.message);
+    console.log("News error:", err.message);
     return [];
   }
 }
 
-// 🧠 Verify
+// Verify news
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
@@ -63,36 +62,40 @@ async function verifyNews(text) {
 
     const sources = articles.map(a => ({
       title: a.title,
-      url: a.url
+      url: a.url,
+      source: a.source?.name || "Unknown"
     }));
 
-    const prompt = `
-Check this claim: "${text}"
+    let aiResponse = "";
 
+    try {
+      const result = await model.generateContent(
+        `Check this claim: "${text}"
 Context:
 ${context}
 
-Return:
-Label (Real/Fake/Uncertain)
-Reason (short)
-`;
+Answer in ONE word: Real, Fake, or Uncertain.
+Also give 1 short reason.`
+      );
 
-    const result = await model.generateContent(prompt);
-    const response = result.response.text();
+      aiResponse = result.response.text();
+    } catch {
+      aiResponse = "Uncertain - AI failed";
+    }
+
+    let label = "Uncertain";
+    if (aiResponse.toLowerCase().includes("real")) label = "Real";
+    else if (aiResponse.toLowerCase().includes("fake")) label = "Fake";
 
     return {
-      label: response.includes("Real")
-        ? "Real"
-        : response.includes("Fake")
-        ? "Fake"
-        : "Uncertain",
+      label,
       confidence: "Medium",
-      reason: response,
+      reason: aiResponse,
       sources
     };
 
   } catch (err) {
-    console.log("VERIFY ERROR:", err);
+    console.log("Verify error:", err);
     return {
       label: "Error",
       confidence: "None",
@@ -102,7 +105,11 @@ Reason (short)
   }
 }
 
-// 🚀 Route
+// Routes
+app.get("/", (req, res) => {
+  res.send("Backend Running ✅");
+});
+
 app.post("/check-news", async (req, res) => {
   const { text } = req.body;
 
@@ -110,19 +117,14 @@ app.post("/check-news", async (req, res) => {
     return res.json({
       label: "Uncertain",
       confidence: "Low",
-      reason: "No input",
+      reason: "No input provided",
       sources: []
     });
   }
-const result = await model.generateContent(prompt);
-const response = result.response.text();
-});
 
-app.get("/", (req, res) => {
-  res.send("Backend Running ✅");
+  const result = await verifyNews(text);
+  res.json(result);
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("🚀 Server running"));
