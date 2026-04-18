@@ -114,9 +114,8 @@ app.post("/check-news", async (req, res) => {
       sources: []
     });
   }
-
-  const result = await verifyNews(text);
-  res.json(result);
+const result = await model.generateContent(prompt);
+const response = result.response.text();
 });
 
 app.get("/", (req, res) => {
