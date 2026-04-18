@@ -13,7 +13,6 @@ app.use(express.json());
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Safety check
 if (!NEWS_API_KEY || !GEMINI_API_KEY) {
   console.error("❌ Missing API keys");
 }
@@ -21,7 +20,10 @@ if (!NEWS_API_KEY || !GEMINI_API_KEY) {
 // Gemini setup
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
-  model: "gemini-1.5-flash"
+  model: "gemini-1.5-flash",
+  generationConfig: {
+    temperature: 0.2
+  }
 });
 
 // Clean input
@@ -29,19 +31,20 @@ function cleanQuery(text) {
   return text
     .replace(/[^a-zA-Z0-9 ]/g, "")
     .split(" ")
+    .filter(w => w.length > 2)
     .slice(0, 6)
     .join(" ");
 }
 
-// Fetch news
+// Fetch news (improved)
 async function fetchNews(query) {
   try {
-    const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&apiKey=${NEWS_API_KEY}`;
+    const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&language=en&pageSize=10&apiKey=${NEWS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
 
     if (data.status === "ok") {
-      return data.articles.slice(0, 5);
+      return data.articles;
     }
     return [];
   } catch (err) {
@@ -50,52 +53,80 @@ async function fetchNews(query) {
   }
 }
 
-// Verify news
+// Verify news (AI upgraded)
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
     const articles = await fetchNews(query);
 
-    const context = articles.length
-      ? articles.map(a => a.title).join("\n")
-      : "No articles found";
+    // Remove duplicates + weak titles
+    const unique = [];
+    const seen = new Set();
 
-    const sources = articles.map(a => ({
+    for (let a of articles) {
+      const key = a.title?.toLowerCase();
+      if (key && !seen.has(key) && a.title.length > 20) {
+        seen.add(key);
+        unique.push(a);
+      }
+    }
+
+    const finalArticles = unique.slice(0, 5);
+
+    const context = finalArticles.length
+      ? finalArticles.map(a => `- ${a.title}`).join("\n")
+      : "No reliable news found";
+
+    const sources = finalArticles.map(a => ({
       title: a.title,
       url: a.url,
       source: a.source?.name || "Unknown"
     }));
 
-    let aiResponse = "";
+    const prompt = `
+You are a strict fact-checking AI.
 
-    try {
-      const result = await model.generateContent(
-        `Check this claim: "${text}"
-Context:
+Claim:
+"${text}"
+
+News Evidence:
 ${context}
 
-Answer in ONE word: Real, Fake, or Uncertain.
-Also give 1 short reason.`
-      );
+Rules:
+- If multiple sources support → Real
+- If sources contradict → Fake
+- If no strong evidence → Uncertain
+- Do NOT guess
 
-      aiResponse = result.response.text();
+Return JSON ONLY:
+{
+  "label": "Real" | "Fake" | "Uncertain",
+  "reason": "Short explanation"
+}
+`;
+
+    let parsed;
+
+    try {
+      const result = await model.generateContent(prompt);
+      const raw = result.response.text();
+      parsed = JSON.parse(raw);
     } catch {
-      aiResponse = "Uncertain - AI failed";
+      parsed = {
+        label: "Uncertain",
+        reason: "AI could not confidently verify this claim"
+      };
     }
 
-    let label = "Uncertain";
-    if (aiResponse.toLowerCase().includes("real")) label = "Real";
-    else if (aiResponse.toLowerCase().includes("fake")) label = "Fake";
-
     return {
-      label,
-      confidence: "Medium",
-      reason: aiResponse,
+      label: parsed.label || "Uncertain",
+      confidence: finalArticles.length >= 3 ? "High" : "Medium",
+      reason: parsed.reason || "Analysis completed",
       sources
     };
 
   } catch (err) {
-    console.log("Verify error:", err);
+    console.log("VERIFY ERROR:", err);
     return {
       label: "Error",
       confidence: "None",
@@ -113,11 +144,11 @@ app.get("/", (req, res) => {
 app.post("/check-news", async (req, res) => {
   const { text } = req.body;
 
-  if (!text) {
+  if (!text || text.length < 5) {
     return res.json({
       label: "Uncertain",
       confidence: "Low",
-      reason: "No input provided",
+      reason: "Enter a valid claim",
       sources: []
     });
   }
@@ -126,5 +157,6 @@ app.post("/check-news", async (req, res) => {
   res.json(result);
 });
 
+// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log("🚀 Server running"));

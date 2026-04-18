@@ -144,7 +144,7 @@
       const btn = document.getElementById("checkBtn");
 
       if (!text) {
-        alert("Enter some text");
+        alert("Please enter some text.");
         return;
       }
 
@@ -154,7 +154,7 @@
       resultDiv.innerHTML = "<p style='text-align:center;'>Connecting to server...</p>";
 
       try {
-        // 🔥 Wake up Render server
+        // 🔥 Wake up backend (Render sleep fix)
         await fetch(BASE_URL);
         await new Promise(r => setTimeout(r, 1500));
 
@@ -202,7 +202,7 @@
         resultDiv.innerHTML = `
           <div class="result-card status-Fake">
             <h2>Connection Error</h2>
-            <p>Server is starting or unreachable. Wait 5 seconds and try again.</p>
+            <p>Server is starting or unreachable. Wait a few seconds and try again.</p>
           </div>
         `;
       }
