@@ -14,142 +14,101 @@ const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 if (!NEWS_API_KEY || !GEMINI_API_KEY) {
-  console.error("❌ Missing API keys");
+  console.error("❌ Missing API keys in .env file");
 }
 
-// Gemini setup
+// Gemini setup - Temperature at 0 for absolute factual strictness
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: "gemini-1.5-flash",
   generationConfig: {
-    temperature: 0.1 // Lowered further for maximum factual strictness
+    temperature: 0,
+    responseMimeType: "application/json" // Natively forces bulletproof JSON
   }
 });
 
-// Clean input
+// Clean input query
 function cleanQuery(text) {
-  const stopwords = new Set(["about","after","all","also","and","any","are","because","been","before","being","between","both","but","can","could","did","does","even","for","from","further","had","has","have","here","how","into","just","like","made","many","more","most","much","must","not","only","other","our","out","over","said","same","see","should","since","some","such","than","that","the","their","them","then","there","these","they","this","those","through","too","under","until","upon","very","was","well","were","what","when","where","which","while","who","will","with","would","you","your","according","reports","claims","stated","true","false","fake","real","news","is","it"]);
-
   return text
     .replace(/[^a-zA-Z0-9 ]/g, "")
     .split(/\s+/)
-    .map(w => w.toLowerCase())
-    .filter(w => w.length > 2 && !stopwords.has(w))
-    .slice(0, 3) 
+    .filter(w => w.length > 3)
+    .slice(0, 5)
     .join(" ");
 }
 
-// Fetch news (Added explicit error logging to catch NewsAPI silent fails)
+// Fetch news evidence
 async function fetchNews(query) {
+  if (!query) return [];
   try {
-    const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=relevancy&language=en&pageSize=10&apiKey=${NEWS_API_KEY}`;
+    const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=relevancy&language=en&pageSize=5&apiKey=${NEWS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
 
-    if (data.status === "error") {
-      console.error("🚨 NEWSAPI CATCH IDENTIFIED:", data.message);
-      return [];
-    }
-
-    if (data.status === "ok") {
+    if (data.status === "ok" && data.articles) {
       return data.articles.filter(a => a.title && !a.title.includes("[Removed]"));
     }
     return [];
   } catch (err) {
-    console.error("🚨 FETCH NEWS ERROR:", err.message);
+    console.error("News fetch error:", err.message);
     return [];
   }
 }
 
-// Verify news (Prompt Un-handcuffed & Bulletproof JSON Parser)
+// Verify news - The Ultimate AI-Driven Pipeline
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
     const articles = await fetchNews(query);
 
-    const unique = [];
-    const seen = new Set();
+    // Prepare context for the AI
+    const liveEvidence = articles.length > 0 
+      ? JSON.stringify(articles.map(a => ({ title: a.title, description: a.description, url: a.url, source: a.source?.name })))
+      : "[]";
 
-    for (let a of articles) {
-      const key = a.title?.toLowerCase();
-      if (key && !seen.has(key) && a.title.length > 20) {
-        seen.add(key);
-        unique.push(a);
-      }
-    }
-
-    const finalArticles = unique.slice(0, 5);
-
-    const context = finalArticles.length
-      ? finalArticles.map(a => `Source: ${a.source?.name}\nTitle: ${a.title}\nSummary: ${a.description || "No summary available"}`).join("\n\n")
-      : "No current news evidence found for this specific query.";
-
-    const sources = finalArticles.map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source?.name || "Unknown"
-    }));
-
-    // THE FIX: The prompt now allows Gemini to use its own brain if NewsAPI fails
     const prompt = `
-You are a highly strict, expert fact-checking AI.
+    You are an elite fact-checking API. Verify the user's claim strictly and accurately.
 
-Claim to Verify:
-"${text}"
+    User Claim: "${text}"
+    Live News Evidence: ${liveEvidence}
 
-Available News Evidence:
-${context}
+    Instructions:
+    1. If the Live News Evidence proves the claim Real or Fake, use it.
+    2. If the Live News Evidence is "[]" (empty) or irrelevant, YOU MUST use your internal historical knowledge to verify the claim. Do NOT default to "Uncertain" unless the claim is genuinely an unprovable opinion or prediction.
+    3. You must provide a "label" (Real, Fake, or Uncertain).
+    4. You must provide a "confidence" (High, Medium, or Low).
+    5. You must provide a "reason" (A crisp, 1-2 sentence definitive explanation).
+    6. You must provide a "sources" array:
+       - If you used Live News Evidence, map those articles into the array.
+       - If you used your internal knowledge, add the names of 2 reliable sources yourself (e.g., "Reuters", "BBC") and provide a relevant Google Search URL for the "url" field (e.g., "https://www.google.com/search?q=...").
 
-Rules:
-1. First, check the Available News Evidence. If it explicitly supports or debunks the claim, base your answer on that.
-2. THE CATCH: If the Available News Evidence says "No current news evidence found" OR is completely unrelated to the claim, you MUST use your own internal verified historical knowledge to fact-check the claim.
-3. Be decisive. Label as "Real" or "Fake" if you know the answer. 
-4. ONLY output "Uncertain" if the claim is highly subjective, an unprovable prediction, or total gibberish.
-
-Return ONLY a raw JSON object. Do not include markdown blocks. Use this exact structure:
-{
-  "analysis": "Internal reasoning step",
-  "label": "Real" | "Fake" | "Uncertain",
-  "reason": "A crisp, definitive 1-2 sentence explanation for the user."
-}
-`;
-
-    let parsed;
-
-    try {
-      const result = await model.generateContent(prompt);
-      const raw = result.response.text();
-      
-      // BULLETPROOF JSON EXTRACTOR: Finds the JSON object even if hidden inside text
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error("No JSON object found in AI response");
-      }
-      
-    } catch (parseErr) {
-      console.error("🚨 JSON PARSE CATCH:", parseErr);
-      parsed = {
-        label: "Uncertain",
-        reason: "The AI encountered an error processing the verification data."
-      };
+    Respond EXACTLY with this JSON schema and nothing else:
+    {
+      "label": "Real" | "Fake" | "Uncertain",
+      "confidence": "High" | "Medium" | "Low",
+      "reason": "Explanation string",
+      "sources": [
+        {
+          "title": "Headline or Topic string",
+          "url": "Valid URL string",
+          "source": "Publisher Name string"
+        }
+      ]
     }
+    `;
 
-    return {
-      label: parsed.label || "Uncertain",
-      confidence: finalArticles.length >= 3 ? "High" : "Medium",
-      reason: parsed.reason || "Analysis completed",
-      sources
-    };
+    // AI generates the entire final JSON object perfectly mapped to your frontend
+    const result = await model.generateContent(prompt);
+    const parsed = JSON.parse(result.response.text());
+
+    return parsed;
 
   } catch (err) {
     console.error("VERIFY ERROR:", err);
     return {
       label: "Error",
       confidence: "None",
-      reason: "Server failed",
+      reason: "Server failed to process the request.",
       sources: []
     };
   }
@@ -163,11 +122,11 @@ app.get("/", (req, res) => {
 app.post("/check-news", async (req, res) => {
   const { text } = req.body;
 
-  if (!text || text.length < 5) {
+  if (!text || text.trim().length < 5) {
     return res.json({
       label: "Uncertain",
       confidence: "Low",
-      reason: "Enter a valid claim",
+      reason: "Please enter a more detailed claim to verify.",
       sources: []
     });
   }
