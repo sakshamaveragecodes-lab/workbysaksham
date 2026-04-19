@@ -22,11 +22,11 @@ const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: "gemini-1.5-flash",
   generationConfig: {
-    temperature: 0.2
+    temperature: 0.1 // Lowered further for maximum factual strictness
   }
 });
 
-// Clean input (Optimized to top 3 keywords so NewsAPI doesn't return 0 results)
+// Clean input
 function cleanQuery(text) {
   const stopwords = new Set(["about","after","all","also","and","any","are","because","been","before","being","between","both","but","can","could","did","does","even","for","from","further","had","has","have","here","how","into","just","like","made","many","more","most","much","must","not","only","other","our","out","over","said","same","see","should","since","some","such","than","that","the","their","them","then","there","these","they","this","those","through","too","under","until","upon","very","was","well","were","what","when","where","which","while","who","will","with","would","you","your","according","reports","claims","stated","true","false","fake","real","news","is","it"]);
 
@@ -35,34 +35,38 @@ function cleanQuery(text) {
     .split(/\s+/)
     .map(w => w.toLowerCase())
     .filter(w => w.length > 2 && !stopwords.has(w))
-    .slice(0, 3) // Changed to 3: Prevents NewsAPI from failing due to overly strict matching
+    .slice(0, 3) 
     .join(" ");
 }
 
-// Fetch news
+// Fetch news (Added explicit error logging to catch NewsAPI silent fails)
 async function fetchNews(query) {
   try {
     const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=relevancy&language=en&pageSize=10&apiKey=${NEWS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
 
+    if (data.status === "error") {
+      console.error("🚨 NEWSAPI CATCH IDENTIFIED:", data.message);
+      return [];
+    }
+
     if (data.status === "ok") {
       return data.articles.filter(a => a.title && !a.title.includes("[Removed]"));
     }
     return [];
   } catch (err) {
-    console.log("News error:", err.message);
+    console.error("🚨 FETCH NEWS ERROR:", err.message);
     return [];
   }
 }
 
-// Verify news (Now feeds the article DESCRIPTION to Gemini, not just the title)
+// Verify news (Prompt Un-handcuffed & Bulletproof JSON Parser)
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
     const articles = await fetchNews(query);
 
-    // Remove duplicates + weak titles
     const unique = [];
     const seen = new Set();
 
@@ -76,10 +80,9 @@ async function verifyNews(text) {
 
     const finalArticles = unique.slice(0, 5);
 
-    // CRITICAL FIX: Passing a.description so Gemini actually knows the facts
     const context = finalArticles.length
       ? finalArticles.map(a => `Source: ${a.source?.name}\nTitle: ${a.title}\nSummary: ${a.description || "No summary available"}`).join("\n\n")
-      : "No reliable news found";
+      : "No current news evidence found for this specific query.";
 
     const sources = finalArticles.map(a => ({
       title: a.title,
@@ -87,6 +90,7 @@ async function verifyNews(text) {
       source: a.source?.name || "Unknown"
     }));
 
+    // THE FIX: The prompt now allows Gemini to use its own brain if NewsAPI fails
     const prompt = `
 You are a highly strict, expert fact-checking AI.
 
@@ -97,18 +101,16 @@ Available News Evidence:
 ${context}
 
 Rules:
-1. Read the Titles AND Summaries provided in the evidence.
-2. If the summaries explicitly support the core claim -> label: "Real"
-3. If the summaries explicitly debunk, contradict, or call the claim a hoax -> label: "Fake"
-4. Be decisive. Do not default to "Uncertain" if the summary gives you a clear answer.
-5. Only output "Uncertain" if the evidence is completely empty or totally unrelated to the claim.
-6. Do NOT rely on your internal training data.
+1. First, check the Available News Evidence. If it explicitly supports or debunks the claim, base your answer on that.
+2. THE CATCH: If the Available News Evidence says "No current news evidence found" OR is completely unrelated to the claim, you MUST use your own internal verified historical knowledge to fact-check the claim.
+3. Be decisive. Label as "Real" or "Fake" if you know the answer. 
+4. ONLY output "Uncertain" if the claim is highly subjective, an unprovable prediction, or total gibberish.
 
-Return ONLY a raw JSON object with no markdown formatting and no backticks. Use this exact structure:
+Return ONLY a raw JSON object. Do not include markdown blocks. Use this exact structure:
 {
-  "analysis": "Briefly evaluate the evidence internally here before deciding",
+  "analysis": "Internal reasoning step",
   "label": "Real" | "Fake" | "Uncertain",
-  "reason": "A crisp, 1-2 sentence explanation for the user based on the evidence"
+  "reason": "A crisp, definitive 1-2 sentence explanation for the user."
 }
 `;
 
@@ -116,16 +118,22 @@ Return ONLY a raw JSON object with no markdown formatting and no backticks. Use 
 
     try {
       const result = await model.generateContent(prompt);
-      let raw = result.response.text();
+      const raw = result.response.text();
       
-      // Strip markdown code blocks
-      raw = raw.replace(/```json/gi, '').replace(/```/gi, '').trim();
-      parsed = JSON.parse(raw);
+      // BULLETPROOF JSON EXTRACTOR: Finds the JSON object even if hidden inside text
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error("No JSON object found in AI response");
+      }
+      
     } catch (parseErr) {
-      console.log("JSON Parse Failed:", parseErr);
+      console.error("🚨 JSON PARSE CATCH:", parseErr);
       parsed = {
         label: "Uncertain",
-        reason: "The evidence was too ambiguous to format a confident response."
+        reason: "The AI encountered an error processing the verification data."
       };
     }
 
@@ -137,7 +145,7 @@ Return ONLY a raw JSON object with no markdown formatting and no backticks. Use 
     };
 
   } catch (err) {
-    console.log("VERIFY ERROR:", err);
+    console.error("VERIFY ERROR:", err);
     return {
       label: "Error",
       confidence: "None",
@@ -170,4 +178,4 @@ app.post("/check-news", async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log("🚀 Server running"));
+app.listen(PORT, () => console.log("🚀 Server running on port " + PORT));
