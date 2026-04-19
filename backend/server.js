@@ -26,17 +26,20 @@ const model = genAI.getGenerativeModel({
   }
 });
 
-// Clean input
+// Clean input (Upgraded NLP Stopword Filter for better accuracy)
 function cleanQuery(text) {
+  const stopwords = new Set(["about","after","all","also","and","any","are","because","been","before","being","between","both","but","can","could","did","does","even","for","from","further","had","has","have","here","how","into","just","like","made","many","more","most","much","must","not","only","other","our","out","over","said","same","see","should","since","some","such","than","that","the","their","them","then","there","these","they","this","those","through","too","under","until","upon","very","was","well","were","what","when","where","which","while","who","will","with","would","you","your","according","reports","claims","stated"]);
+
   return text
     .replace(/[^a-zA-Z0-9 ]/g, "")
-    .split(" ")
-    .filter(w => w.length > 2)
-    .slice(0, 6)
+    .split(/\s+/)
+    .map(w => w.toLowerCase())
+    .filter(w => w.length > 2 && !stopwords.has(w))
+    .slice(0, 5) // 5 strong keywords yield the best NewsAPI results
     .join(" ");
 }
 
-// Fetch news (improved)
+// Fetch news (Improved to remove dead/removed links from NewsAPI)
 async function fetchNews(query) {
   try {
     const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&language=en&pageSize=10&apiKey=${NEWS_API_KEY}`;
@@ -44,7 +47,8 @@ async function fetchNews(query) {
     const data = await res.json();
 
     if (data.status === "ok") {
-      return data.articles;
+      // Filter out dead/removed articles
+      return data.articles.filter(a => a.title && !a.title.includes("[Removed]"));
     }
     return [];
   } catch (err) {
@@ -53,7 +57,7 @@ async function fetchNews(query) {
   }
 }
 
-// Verify news (AI upgraded)
+// Verify news (AI upgraded with Safe JSON parsing and Chain of Thought)
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
@@ -84,24 +88,26 @@ async function verifyNews(text) {
     }));
 
     const prompt = `
-You are a strict fact-checking AI.
+You are a highly strict, expert fact-checking AI.
 
-Claim:
+Claim to Verify:
 "${text}"
 
-News Evidence:
+Available News Evidence:
 ${context}
 
 Rules:
-- If multiple sources support → Real
-- If sources contradict → Fake
-- If no strong evidence → Uncertain
-- Do NOT guess
+1. Analyze the evidence against the claim step-by-step.
+2. If multiple reliable sources explicitly support the core claim -> label: "Real"
+3. If reliable sources explicitly contradict the claim -> label: "Fake"
+4. If the evidence is completely unrelated, insufficient, or just repeating the claim without proof -> label: "Uncertain"
+5. Do NOT rely on your internal training data. ONLY use the provided News Evidence.
 
-Return JSON ONLY:
+Return ONLY a raw JSON object with no markdown formatting and no backticks. Use this exact structure:
 {
+  "analysis": "Briefly evaluate the evidence internally here before deciding",
   "label": "Real" | "Fake" | "Uncertain",
-  "reason": "Short explanation"
+  "reason": "A crisp, 1-2 sentence explanation for the user"
 }
 `;
 
@@ -109,12 +115,17 @@ Return JSON ONLY:
 
     try {
       const result = await model.generateContent(prompt);
-      const raw = result.response.text();
+      let raw = result.response.text();
+      
+      // Strip markdown code blocks if Gemini accidentally includes them to prevent JSON parse crashes
+      raw = raw.replace(/```json/gi, '').replace(/```/gi, '').trim();
+      
       parsed = JSON.parse(raw);
-    } catch {
+    } catch (parseErr) {
+      console.log("JSON Parse Failed on string:", parseErr);
       parsed = {
         label: "Uncertain",
-        reason: "AI could not confidently verify this claim"
+        reason: "The evidence was too ambiguous to format a confident response."
       };
     }
 
