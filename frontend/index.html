@@ -2,223 +2,169 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Veritas | AI Fact Checker</title>
+  <title>AI Fact Checker</title>
 
   <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: #1e293b;
-      --text: #f8fafc;
-      --accent: #3b82f6;
-      --real: #10b981;
-      --fake: #ef4444;
-      --uncertain: #f59e0b;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      background-color: var(--bg);
-      color: var(--text);
+      font-family: Arial;
+      background: #0f172a;
+      color: #e2e8f0;
+      text-align: center;
       padding: 20px;
     }
 
-    .container {
-      max-width: 800px;
-      margin: 40px auto;
-    }
-
     h1 {
-      text-align: center;
-      margin-bottom: 30px;
-      font-size: 2.5rem;
-      font-weight: 800;
-    }
-
-    .input-group {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 30px;
+      margin-bottom: 20px;
     }
 
     textarea {
-      flex: 1;
-      padding: 15px;
-      border-radius: 8px;
-      border: 1px solid #334155;
-      background: #0f172a;
-      color: #fff;
-      min-height: 60px;
-      resize: vertical;
+      width: 80%;
+      height: 100px;
+      padding: 10px;
+      border-radius: 10px;
+      border: none;
+      font-size: 16px;
     }
 
     button {
-      padding: 15px 30px;
-      background-color: var(--accent);
-      color: white;
+      margin-top: 15px;
+      padding: 10px 20px;
       border: none;
-      border-radius: 8px;
-      font-weight: bold;
+      border-radius: 10px;
+      background: #3b82f6;
+      color: white;
+      font-size: 16px;
       cursor: pointer;
     }
 
-    button:hover { background-color: #2563eb; }
-
-    .result-card {
-      background: var(--card-bg);
-      padding: 25px;
+    .result {
+      margin-top: 30px;
+      padding: 20px;
       border-radius: 12px;
-      margin-top: 20px;
-      border-left: 5px solid transparent;
     }
 
-    .status-Real { border-left-color: var(--real); }
-    .status-Fake { border-left-color: var(--fake); }
-    .status-Uncertain { border-left-color: var(--uncertain); }
+    .real { background: #064e3b; }
+    .fake { background: #7f1d1d; }
+    .uncertain { background: #78350f; }
 
-    .result-card h2 {
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 10px;
+    .confidence {
+      font-size: 14px;
+      margin-top: 5px;
+      opacity: 0.8;
     }
 
-    .source-list {
+    .reason {
       margin-top: 15px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+      font-size: 15px;
     }
 
-    .source-item {
-      background: #0f172a;
-      padding: 12px;
-      border-radius: 6px;
-      color: var(--accent);
+    .sources {
+      margin-top: 25px;
+      text-align: left;
+    }
+
+    .card {
+      background: #1e293b;
+      padding: 15px;
+      margin: 10px 0;
+      border-radius: 10px;
+    }
+
+    .card a {
+      color: #60a5fa;
       text-decoration: none;
-      display: block;
     }
 
-    .source-item span {
-      display: block;
-      font-size: 0.85rem;
-      color: #94a3b8;
+    .tag {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      margin-top: 5px;
     }
 
-    .sources-title {
-      font-weight: bold;
-      margin-top: 20px;
-      margin-bottom: 10px;
-    }
+    .support { background: #065f46; }
+    .contradict { background: #991b1b; }
+    .neutral { background: #374151; }
 
-    @media (max-width: 600px) {
-      .input-group {
-        flex-direction: column;
-      }
-      button {
-        width: 100%;
-      }
-    }
   </style>
 </head>
 
 <body>
-  <div class="container">
-    <h1>Veritas | AI Fact Checker</h1>
 
-    <div class="input-group">
-      <textarea id="newsInput" placeholder="Paste a news claim or article here..."></textarea>
-      <button onclick="checkNews()" id="checkBtn">Verify</button>
-    </div>
+<h1>🧠 AI Fact Checker</h1>
 
-    <div id="result"></div>
-  </div>
+<textarea id="input" placeholder="Enter a claim..."></textarea><br>
+<button onclick="check()">Verify</button>
 
-  <script>
-    const BASE_URL = "https://workbysaksham.onrender.com";
+<div id="output"></div>
 
-    async function checkNews() {
-      const text = document.getElementById("newsInput").value.trim();
-      const resultDiv = document.getElementById("result");
-      const btn = document.getElementById("checkBtn");
+<script>
+const BASE_URL = "https://your-backend-url.onrender.com"; // 🔥 CHANGE THIS
 
-      if (!text) {
-        alert("Please enter some text.");
-        return;
-      }
+async function check() {
+  const text = document.getElementById("input").value;
+  const output = document.getElementById("output");
 
-      btn.innerText = "Checking...";
-      btn.disabled = true;
+  output.innerHTML = "Checking...";
 
-      resultDiv.innerHTML = "<p style='text-align:center;'>Connecting to server...</p>";
-
-      try {
-        // 🔥 Wake up backend (Render sleep fix)
-       let attempts = 0;
-let success = false;
-
-while (attempts < 3 && !success) {
   try {
-    const wake = await fetch(BASE_URL);
-    if (wake.ok) success = true;
-  } catch {}
-  attempts++;
-  await new Promise(r => setTimeout(r, 2000));
+    const res = await fetch(BASE_URL + "/check-news", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ text })
+    });
+
+    const data = await res.json();
+
+    renderResult(data);
+
+  } catch (err) {
+    output.innerHTML = "Error connecting to server.";
+  }
 }
 
-        resultDiv.innerHTML = "<p style='text-align:center;'>Analyzing news...</p>";
 
-        const res = await fetch(BASE_URL + "/check-news", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text })
-        });
+function renderResult(data) {
+  const output = document.getElementById("output");
 
-        if (!res.ok) throw new Error("Server error");
+  let className = "uncertain";
+  if (data.label === "Real") className = "real";
+  if (data.label === "Fake") className = "fake";
 
-        const data = await res.json();
+  let html = `
+    <div class="result ${className}">
+      <h2>${data.label}</h2>
+      <div class="confidence">Confidence: ${data.confidence}</div>
+      <div class="reason">${data.reason}</div>
+    </div>
+  `;
 
-        let sourcesHTML = "";
+  if (data.sources && data.sources.length > 0) {
+    html += `<div class="sources"><h3>🔎 Evidence</h3>`;
 
-        if (data.sources && data.sources.length > 0) {
-          sourcesHTML = `
-            <div class="sources-title">Sources:</div>
-            <div class="source-list">
-              ${data.sources.map(s => `
-                <a href="${s.url}" target="_blank" class="source-item">
-                  ${s.title}
-                  <span>${s.source}</span>
-                </a>
-              `).join("")}
-            </div>
-          `;
-        } else {
-          sourcesHTML = `<div class="sources-title">No sources found</div>`;
-        }
+    data.sources.forEach(src => {
+      const stanceClass = src.stance || "neutral";
 
-        resultDiv.innerHTML = `
-          <div class="result-card status-${data.label}">
-            <h2>${data.label} <span>(${data.confidence})</span></h2>
-            <p>${data.reason}</p>
-            ${sourcesHTML}
+      html += `
+        <div class="card">
+          <a href="${src.url}" target="_blank">${src.title}</a>
+          <div>${src.source || ""}</div>
+          <div class="tag ${stanceClass}">
+            ${stanceClass.toUpperCase()}
           </div>
-        `;
+        </div>
+      `;
+    });
 
-      } catch (error) {
-        console.error(error);
+    html += `</div>`;
+  }
 
-        resultDiv.innerHTML = `
-          <div class="result-card status-Fake">
-            <h2>Connection Error</h2>
-            <p>Server is starting or unreachable. Wait a few seconds and try again.</p>
-          </div>
-        `;
-      }
+  output.innerHTML = html;
+}
+</script>
 
-      btn.innerText = "Verify";
-      btn.disabled = false;
-    }
-  </script>
 </body>
 </html>
