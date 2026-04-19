@@ -16,11 +16,11 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Gemini (explanation only)
+// Gemini (only explanation)
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: "gemini-1.5-flash",
-  generationConfig: { temperature: 0.1 }
+  generationConfig: { temperature: 0.2 }
 });
 
 
@@ -32,10 +32,12 @@ const cache = new Map();
 function getCache(key) {
   const data = cache.get(key);
   if (!data) return null;
+
   if (Date.now() - data.time > 5 * 60 * 1000) {
     cache.delete(key);
     return null;
   }
+
   return data.value;
 }
 
@@ -59,7 +61,7 @@ function extractKeywords(text) {
 
 
 // ----------------------
-// 📰 FETCH DATA
+// 📰 FETCH NEWS
 // ----------------------
 async function fetchNews(query) {
   const cached = getCache("news_" + query);
@@ -80,11 +82,16 @@ async function fetchNews(query) {
 
     setCache("news_" + query, results);
     return results;
+
   } catch {
     return [];
   }
 }
 
+
+// ----------------------
+// 🌐 GOOGLE SEARCH
+// ----------------------
 async function fetchGoogle(query) {
   const cached = getCache("google_" + query);
   if (cached) return cached;
@@ -106,6 +113,7 @@ async function fetchGoogle(query) {
 
     setCache("google_" + query, results);
     return results;
+
   } catch {
     return [];
   }
@@ -113,62 +121,42 @@ async function fetchGoogle(query) {
 
 
 // ----------------------
-// 🧹 FILTER LOW QUALITY
+// 🧹 CLEAN BAD SOURCES
 // ----------------------
-function filterLowQuality(evidence) {
+function cleanEvidence(evidence) {
   return evidence.filter(e => {
-    if (!e.title || e.title.length < 20) return false;
-    if (!e.description || e.description.length < 40) return false;
-    if (!e.url.startsWith("http")) return false;
+    if (!e.url) return false;
+
+    // ❌ remove junk
+    if (e.url.includes("youtube")) return false;
+    if (e.url.includes("shorts")) return false;
+
+    if (!e.description || e.description.length < 50) return false;
+
     return true;
   });
 }
 
 
 // ----------------------
-// 🧠 DOMAIN CREDIBILITY (NO HARDCODING)
+// 🎯 RELEVANCE FILTER
 // ----------------------
-function domainScore(url) {
-  try {
-    const domain = new URL(url).hostname;
+function isRelevant(evidence, claim) {
+  const claimWords = claim.toLowerCase().split(" ");
+  const text = (evidence.title + " " + evidence.description).toLowerCase();
 
-    let score = 0;
+  let matches = 0;
 
-    if (domain.includes(".gov")) score += 3;
-    if (domain.includes(".edu")) score += 3;
-
-    if (domain.split(".").length <= 3) score += 1;
-
-    if (!domain.includes("-")) score += 0.5;
-
-    return score;
-  } catch {
-    return 0;
-  }
-}
-
-
-// ----------------------
-// 🧠 MATCH STRENGTH
-// ----------------------
-function matchScore(evidence, claim) {
-  const words = claim.toLowerCase().split(" ");
-
-  return evidence.map(e => {
-    let match = 0;
-    const text = (e.title + " " + e.description).toLowerCase();
-
-    words.forEach(w => {
-      if (w.length > 3 && text.includes(w)) match++;
-    });
-
-    return { ...e, match };
+  claimWords.forEach(w => {
+    if (w.length > 4 && text.includes(w)) matches++;
   });
+
+  return matches >= 2;
 }
 
 
 // ----------------------
-// ⚖️ STANCE
+// ⚖️ STANCE DETECTION
 // ----------------------
 function detectStance(evidence) {
   return evidence.map(e => {
@@ -179,16 +167,17 @@ function detectStance(evidence) {
     if (
       text.includes("false") ||
       text.includes("fake") ||
-      text.includes("hoax") ||
-      text.includes("misleading") ||
-      text.includes("debunk")
+      text.includes("debunk") ||
+      text.includes("misleading")
     ) {
       stance = "contradict";
     }
 
     else if (
-      text.includes("official statement") ||
-      text.includes("confirmed report")
+      text.includes("confirmed") ||
+      text.includes("announced") ||
+      text.includes("reported") ||
+      text.includes("according to")
     ) {
       stance = "support";
     }
@@ -199,41 +188,18 @@ function detectStance(evidence) {
 
 
 // ----------------------
-// 🏆 FINAL SCORING
-// ----------------------
-function scoreEvidence(evidence) {
-  return evidence.map(e => {
-    let score = 0;
-
-    if (e.stance === "contradict") score -= 4;
-    if (e.stance === "support") score += 3;
-
-    score += e.match * 0.5;
-    score += domainScore(e.url);
-
-    if (e.description.length < 60) score -= 1;
-
-    return { ...e, score };
-  });
-}
-
-
-// ----------------------
-// 🎯 VERDICT
+// 🎯 FINAL VERDICT (BALANCED)
 // ----------------------
 function finalVerdict(evidence) {
-  let total = 0;
-  evidence.forEach(e => total += e.score);
-
   const support = evidence.filter(e => e.stance === "support").length;
   const contradict = evidence.filter(e => e.stance === "contradict").length;
 
-  if (contradict >= 2 || total <= -5) {
+  if (contradict >= 2) {
     return { label: "Fake", confidence: "High" };
   }
 
-  if (support >= 3 && total >= 6) {
-    return { label: "Real", confidence: "High" };
+  if (support >= 1 && contradict === 0) {
+    return { label: "Real", confidence: "Medium" };
   }
 
   return { label: "Uncertain", confidence: "Low" };
@@ -241,7 +207,7 @@ function finalVerdict(evidence) {
 
 
 // ----------------------
-// 🧠 VERIFY
+// 🧠 MAIN VERIFY
 // ----------------------
 async function verifyNews(text) {
   const cached = getCache("final_" + text);
@@ -257,33 +223,33 @@ async function verifyNews(text) {
 
     let evidence = [...news, ...google];
 
+    // 🔥 CLEAN + FILTER
+    evidence = cleanEvidence(evidence);
+    evidence = evidence.filter(e => isRelevant(e, text));
+
     if (evidence.length === 0) {
       return {
         label: "Uncertain",
         confidence: "Low",
-        reason: "No evidence found.",
+        reason: "No relevant evidence found.",
         sources: []
       };
     }
 
-    evidence = filterLowQuality(evidence);
-    evidence = matchScore(evidence, text);
     evidence = detectStance(evidence);
-    evidence = scoreEvidence(evidence);
 
     const { label, confidence } = finalVerdict(evidence);
 
-    let reason = "No explanation available";
+    // 🧠 Explanation
+    let reason = "Based on available sources.";
 
     try {
       const prompt = `
       Claim: "${text}"
       Verdict: ${label}
+      Evidence: ${JSON.stringify(evidence)}
 
-      Evidence:
-      ${JSON.stringify(evidence)}
-
-      Explain clearly.
+      Explain simply.
       `;
       const ai = await model.generateContent(prompt);
       reason = ai.response.text();
@@ -293,15 +259,12 @@ async function verifyNews(text) {
       label,
       confidence,
       reason,
-      sources: evidence
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 5)
-        .map(e => ({
-          title: e.title,
-          url: e.url,
-          source: e.source,
-          stance: e.stance
-        }))
+      sources: evidence.slice(0, 5).map(e => ({
+        title: e.title,
+        url: e.url,
+        source: e.source,
+        stance: e.stance
+      }))
     };
 
     setCache("final_" + text, result);
@@ -321,6 +284,10 @@ async function verifyNews(text) {
 // ----------------------
 // ROUTES
 // ----------------------
+app.get("/", (req, res) => {
+  res.send("Backend Running ✅");
+});
+
 app.post("/check-news", async (req, res) => {
   const { text } = req.body;
 
@@ -335,10 +302,6 @@ app.post("/check-news", async (req, res) => {
 
   const result = await verifyNews(text);
   res.json(result);
-});
-
-app.get("/", (req, res) => {
-  res.send("Backend Running ✅");
 });
 
 
