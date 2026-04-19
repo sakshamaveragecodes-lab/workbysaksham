@@ -155,8 +155,17 @@
 
       try {
         // 🔥 Wake up backend (Render sleep fix)
-        await fetch(BASE_URL);
-        await new Promise(r => setTimeout(r, 1500));
+       let attempts = 0;
+let success = false;
+
+while (attempts < 3 && !success) {
+  try {
+    const wake = await fetch(BASE_URL);
+    if (wake.ok) success = true;
+  } catch {}
+  attempts++;
+  await new Promise(r => setTimeout(r, 2000));
+}
 
         resultDiv.innerHTML = "<p style='text-align:center;'>Analyzing news...</p>";
 

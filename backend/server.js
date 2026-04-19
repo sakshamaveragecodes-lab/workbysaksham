@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-dotenv.config({ path: "./backend.env" });
+dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -31,8 +31,8 @@ function cleanQuery(text) {
   return text
     .replace(/[^a-zA-Z0-9 ]/g, "")
     .split(/\s+/)
-    .filter(w => w.length > 3)
-    .slice(0, 5)
+    .filter(w => w.length > 2)
+    .slice(0, 8)
     .join(" ");
 }
 
@@ -43,10 +43,11 @@ async function fetchNews(query) {
     const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=relevancy&language=en&pageSize=5&apiKey=${NEWS_API_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
-
-    if (data.status === "ok" && data.articles) {
-      return data.articles.filter(a => a.title && !a.title.includes("[Removed]"));
-    }
+ 
+    if (data.status !== "ok") {
+  console.error("News API Error:", data);
+  }
+  
     return [];
   } catch (err) {
     console.error("News fetch error:", err.message);
@@ -121,9 +122,19 @@ async function verifyNews(text) {
     const rawText = result.response.text();
 
     // Route the raw AI text through the failsafe extractor
-    const parsed = extractJSON(rawText);
+    let parsed;
+try {
+  parsed = extractJSON(rawText);
+} catch {
+  return {
+    label: "Uncertain",
+    confidence: "Low",
+    reason: "AI response could not be parsed properly.",
+    sources: []
+  };
+}
 
-    return parsed;
+return parsed;
 
   } catch (err) {
     // Detailed error logging to the terminal so we can diagnose any future API hiccups
