@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-dotenv.config();
+dotenv.config({ path: "./backend.env" });
 
 const app = express();
 app.use(cors());
@@ -17,13 +17,12 @@ if (!NEWS_API_KEY || !GEMINI_API_KEY) {
   console.error("❌ Missing API keys in .env file");
 }
 
-// Gemini setup - Temperature at 0 for absolute factual strictness
+// Gemini setup
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
   model: "gemini-1.5-flash",
   generationConfig: {
-    temperature: 0,
-    responseMimeType: "application/json" // Natively forces bulletproof JSON
+    temperature: 0.1 // Kept low for factual strictness
   }
 });
 
@@ -55,7 +54,28 @@ async function fetchNews(query) {
   }
 }
 
-// Verify news - The Ultimate AI-Driven Pipeline
+// 3-Step Failsafe JSON Extractor
+function extractJSON(rawText) {
+  try {
+    // 1. Try parsing normally first
+    return JSON.parse(rawText);
+  } catch (err) {
+    try {
+      // 2. If it fails, strip markdown backticks and try again
+      const stripped = rawText.replace(/```json/gi, "").replace(/```/gi, "").trim();
+      return JSON.parse(stripped);
+    } catch (err2) {
+      // 3. If it STILL fails, use regex to rip the JSON object out of any surrounding text
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if (match) {
+        return JSON.parse(match[0]);
+      }
+      throw new Error("No JSON structure found in AI response");
+    }
+  }
+}
+
+// Verify news - The Indestructible Pipeline
 async function verifyNews(text) {
   try {
     const query = cleanQuery(text);
@@ -80,7 +100,7 @@ async function verifyNews(text) {
     5. You must provide a "reason" (A crisp, 1-2 sentence definitive explanation).
     6. You must provide a "sources" array:
        - If you used Live News Evidence, map those articles into the array.
-       - If you used your internal knowledge, add the names of 2 reliable sources yourself (e.g., "Reuters", "BBC") and provide a relevant Google Search URL for the "url" field (e.g., "https://www.google.com/search?q=...").
+       - If you used your internal knowledge, add the names of 2 reliable sources yourself (e.g., "Reuters", "BBC") and provide a relevant Google Search URL for the "url" field.
 
     Respond EXACTLY with this JSON schema and nothing else:
     {
@@ -97,18 +117,21 @@ async function verifyNews(text) {
     }
     `;
 
-    // AI generates the entire final JSON object perfectly mapped to your frontend
     const result = await model.generateContent(prompt);
-    const parsed = JSON.parse(result.response.text());
+    const rawText = result.response.text();
+
+    // Route the raw AI text through the failsafe extractor
+    const parsed = extractJSON(rawText);
 
     return parsed;
 
   } catch (err) {
-    console.error("VERIFY ERROR:", err);
+    // Detailed error logging to the terminal so we can diagnose any future API hiccups
+    console.error("VERIFY ERROR CAUGHT:", err.message);
     return {
       label: "Error",
       confidence: "None",
-      reason: "Server failed to process the request.",
+      reason: "Server failed to process the verification logic.",
       sources: []
     };
   }
@@ -136,5 +159,5 @@ app.post("/check-news", async (req, res) => {
 });
 
 // Start server
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => console.log("🚀 Server running on port " + PORT));
