@@ -15,7 +15,7 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🧠 STABLE EMBEDDING (WITH TIMEOUT + FALLBACK)
+   🧠 EMBEDDING (SAFE + FALLBACK)
 ------------------------- */
 async function getEmbedding(text) {
   const controller = new AbortController();
@@ -48,7 +48,7 @@ async function getEmbedding(text) {
     );
 
   } catch {
-    // fallback (never fail)
+    // fallback embedding
     return text
       .toLowerCase()
       .slice(0, 60)
@@ -76,7 +76,7 @@ function extractKeywords(text) {
 }
 
 /* -------------------------
-   🌐 FETCH MORE NEWS (MULTI QUERY)
+   🌐 FETCH NEWS (MULTI QUERY)
 ------------------------- */
 async function fetchNews(text) {
   const keywords = extractKeywords(text);
@@ -120,7 +120,7 @@ async function fetchNews(text) {
     );
   }
 
-  // remove duplicates
+  // deduplicate
   const seen = new Set();
   return results.filter(a => {
     const key = a.title?.toLowerCase().slice(0, 80);
@@ -149,78 +149,123 @@ function detectBias(articles) {
 }
 
 /* -------------------------
-   📊 ANALYSIS (HYBRID)
+   📊 ANALYSIS (DUAL MODE)
 ------------------------- */
 async function analyze(text) {
   const articles = await fetchNews(text);
+  const keywords = extractKeywords(text);
 
-  if (articles.length < 3) {
+  /* -------------------------
+     🟢 HIGH COVERAGE MODE
+  ------------------------- */
+  if (articles.length >= 3) {
+
+    const inputEmb = await getEmbedding(text);
+
+    let scored = [];
+
+    const limited = articles.slice(0, 4);
+
+    for (let a of limited) {
+      const combined = a.title + " " + (a.desc || "");
+
+      const emb = await getEmbedding(combined);
+
+      const sim = cosine(inputEmb, emb);
+
+      const keywordScore = keywords.filter(k =>
+        combined.toLowerCase().includes(k)
+      ).length * 0.05;
+
+      const hours = (Date.now() - a.date) / (1000 * 60 * 60);
+      const recency = hours < 24 ? 0.1 : hours < 72 ? 0.05 : 0;
+
+      const trusted =
+        ["bbc","reuters","ap","the hindu","indian express"]
+          .some(s => a.source?.toLowerCase().includes(s));
+
+      const sourceScore = trusted ? 0.1 : 0;
+
+      const score = sim * 0.7 + keywordScore + recency + sourceScore;
+
+      scored.push({ ...a, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+
+    const top = scored.slice(0, 5);
+
+    const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
+
+    const confidence = Math.min(92, Math.round(avg * 100));
+
+    let verdict = "Suspicious";
+    if (confidence > 70) verdict = "Real";
+    else if (confidence < 40) verdict = "Fake";
+
     return {
-      verdict: "Suspicious",
-      confidence: 30,
+      verdict,
+      confidence,
+      bias: detectBias(top),
+      reason: "Multi-source verification (high coverage)",
+      sources: top.map(a => ({
+        title: a.title,
+        url: a.url,
+        source: a.source
+      }))
+    };
+  }
+
+  /* -------------------------
+     🔴 LOW COVERAGE MODE
+  ------------------------- */
+  const article = articles[0];
+
+  if (!article) {
+    return {
+      verdict: "Unknown",
+      confidence: 20,
       bias: "Unknown",
-      reason: "Low news coverage",
+      reason: "No news found anywhere",
       sources: []
     };
   }
 
-  const inputEmb = await getEmbedding(text);
+  const combined = article.title + " " + (article.desc || "");
 
-  let scored = [];
+  const keywordMatch = keywords.filter(k =>
+    combined.toLowerCase().includes(k)
+  ).length;
 
-  // Only top 4 for AI (stability)
-  const limited = articles.slice(0, 4);
+  const trusted =
+    ["bbc","reuters","ap","the hindu","indian express"]
+      .some(s => article.source?.toLowerCase().includes(s));
 
-  for (let a of limited) {
-    const combined = a.title + " " + (a.desc || "");
+  const clickbait =
+    /shocking|breaking|you won’t believe|viral|must see/i.test(combined);
 
-    const emb = await getEmbedding(combined);
+  let confidence = 40;
 
-    const sim = cosine(inputEmb, emb);
+  if (trusted) confidence += 20;
+  if (keywordMatch > 2) confidence += 15;
+  if (clickbait) confidence -= 15;
 
-    const keywordScore = extractKeywords(text).filter(k =>
-      combined.toLowerCase().includes(k)
-    ).length * 0.05;
+  confidence = Math.max(20, Math.min(75, confidence));
 
-    const hours = (Date.now() - a.date) / (1000 * 60 * 60);
-    const recency =
-      hours < 12 ? 0.15 :
-      hours < 48 ? 0.08 :
-      hours < 120 ? 0.03 : 0;
-
-    const trusted =
-      ["bbc","reuters","ap","the hindu","indian express"]
-        .some(s => a.source?.toLowerCase().includes(s));
-
-    const sourceScore = trusted ? 0.1 : 0;
-
-    const score = sim * 0.7 + keywordScore + recency + sourceScore;
-
-    scored.push({ ...a, score });
-  }
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const top = scored.slice(0, 5);
-
-  const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
-
-  const confidence = Math.min(92, Math.round(avg * 100));
-
-  let verdict = "Suspicious";
-  if (confidence > 70) verdict = "Real";
-  else if (confidence < 40) verdict = "Fake";
+  let verdict = "Unverified";
+  if (confidence > 60) verdict = "Likely Real";
+  if (confidence < 35) verdict = "Possibly Fake";
 
   return {
     verdict,
     confidence,
-    bias: detectBias(top),
-    reason: "Hybrid scoring: semantic + keyword + recency + trusted sources",
-    sources: top.map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source
-    }))
+    bias: detectBias([article]),
+    reason: "Low coverage: source credibility + content analysis",
+    sources: [{
+      title: article.title,
+      url: article.url,
+      source: article.source
+    }]
   };
 }
 
