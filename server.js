@@ -7,9 +7,6 @@ dotenv.config();
 
 const app = express();
 
-/* -------------------------
-   ✅ MIDDLEWARE
-------------------------- */
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "1mb" }));
 
@@ -18,7 +15,7 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🧠 SAFE EMBEDDING (NO HANG GUARANTEE)
+   🧠 STABLE EMBEDDING (WITH TIMEOUT + FALLBACK)
 ------------------------- */
 async function getEmbedding(text) {
   const controller = new AbortController();
@@ -42,9 +39,7 @@ async function getEmbedding(text) {
 
     const data = await res.json();
 
-    if (!Array.isArray(data)) {
-      throw new Error("HF bad response");
-    }
+    if (!Array.isArray(data)) throw new Error("HF failed");
 
     const vectors = data[0];
 
@@ -52,21 +47,17 @@ async function getEmbedding(text) {
       vectors.reduce((sum, v) => sum + v[i], 0) / vectors.length
     );
 
-  } catch (err) {
-    console.error("⚠️ HF failed → fallback used");
-
-    // 🔥 fallback embedding (always works)
+  } catch {
+    // fallback (never fail)
     return text
       .toLowerCase()
-      .slice(0, 50)
+      .slice(0, 60)
       .split("")
       .map(c => c.charCodeAt(0) / 255);
   }
 }
 
-/* -------------------------
-   📐 COSINE
-------------------------- */
+/* ------------------------- */
 function cosine(a, b) {
   const len = Math.min(a.length, b.length);
   let dot = 0;
@@ -74,56 +65,64 @@ function cosine(a, b) {
   return dot;
 }
 
-/* -------------------------
-   🔑 KEYWORDS
-------------------------- */
+/* ------------------------- */
 function extractKeywords(text) {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, "")
     .split(" ")
     .filter(w => w.length > 3)
-    .slice(0, 5);
+    .slice(0, 6);
 }
 
 /* -------------------------
-   🌐 FETCH NEWS
+   🌐 FETCH MORE NEWS (MULTI QUERY)
 ------------------------- */
 async function fetchNews(text) {
-  const query = extractKeywords(text).join(" ");
+  const keywords = extractKeywords(text);
 
-  const [gnews, mediastack] = await Promise.all([
-    fetch(`https://gnews.io/api/v4/search?q=${query}&max=3&lang=en&apikey=${GNEWS_API_KEY}`)
-      .then(r => r.json())
-      .then(d => d.articles || [])
-      .catch(() => []),
-
-    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=3`)
-      .then(r => r.json())
-      .then(d => d.data || [])
-      .catch(() => [])
-  ]);
-
-  const all = [
-    ...gnews.map(a => ({
-      title: a.title,
-      desc: a.description,
-      url: a.url,
-      source: a.source?.name || "Unknown",
-      date: new Date(a.publishedAt)
-    })),
-    ...mediastack.map(a => ({
-      title: a.title,
-      desc: a.description,
-      url: a.url,
-      source: a.source,
-      date: new Date(a.published_at)
-    }))
+  const queries = [
+    keywords.join(" "),
+    keywords.slice(0, 3).join(" "),
+    text.slice(0, 60)
   ];
+
+  let results = [];
+
+  for (let q of queries) {
+    const [gnews, mediastack] = await Promise.all([
+      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&sortby=relevance&apikey=${GNEWS_API_KEY}`)
+        .then(r => r.json())
+        .then(d => d.articles || [])
+        .catch(() => []),
+
+      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5&sort=published_desc`)
+        .then(r => r.json())
+        .then(d => d.data || [])
+        .catch(() => [])
+    ]);
+
+    results.push(
+      ...gnews.map(a => ({
+        title: a.title,
+        desc: a.description,
+        url: a.url,
+        source: a.source?.name || "Unknown",
+        date: new Date(a.publishedAt)
+      })),
+      ...mediastack.map(a => ({
+        title: a.title,
+        desc: a.description,
+        url: a.url,
+        source: a.source,
+        date: new Date(a.published_at)
+      }))
+    );
+  }
 
   // remove duplicates
   const seen = new Set();
-  return all.filter(a => {
+  return results.filter(a => {
     const key = a.title?.toLowerCase().slice(0, 80);
     if (!key || seen.has(key)) return false;
     seen.add(key);
@@ -132,7 +131,7 @@ async function fetchNews(text) {
 }
 
 /* -------------------------
-   🧭 BIAS
+   🧭 BIAS DETECTION
 ------------------------- */
 function detectBias(articles) {
   const sources = articles.map(a => (a.source || "").toLowerCase());
@@ -144,23 +143,23 @@ function detectBias(articles) {
     if (["fox","nypost"].some(k => s.includes(k))) right++;
   });
 
-  if (left > right) return "Left-leaning";
-  if (right > left) return "Right-leaning";
-  return "Balanced";
+  if (left > right + 1) return "Left-leaning";
+  if (right > left + 1) return "Right-leaning";
+  return "Balanced / Mixed";
 }
 
 /* -------------------------
-   📊 ANALYSIS
+   📊 ANALYSIS (HYBRID)
 ------------------------- */
 async function analyze(text) {
   const articles = await fetchNews(text);
 
-  if (articles.length === 0) {
+  if (articles.length < 3) {
     return {
       verdict: "Suspicious",
       confidence: 30,
       bias: "Unknown",
-      reason: "No news coverage found",
+      reason: "Low news coverage",
       sources: []
     };
   }
@@ -169,8 +168,8 @@ async function analyze(text) {
 
   let scored = [];
 
-  // 🔥 ONLY 1 ARTICLE → avoids HF overload
-  const limited = articles.slice(0, 1);
+  // Only top 4 for AI (stability)
+  const limited = articles.slice(0, 4);
 
   for (let a of limited) {
     const combined = a.title + " " + (a.desc || "");
@@ -184,18 +183,29 @@ async function analyze(text) {
     ).length * 0.05;
 
     const hours = (Date.now() - a.date) / (1000 * 60 * 60);
-    const recency = hours < 24 ? 0.1 : 0;
+    const recency =
+      hours < 12 ? 0.15 :
+      hours < 48 ? 0.08 :
+      hours < 120 ? 0.03 : 0;
 
-    const score = sim * 0.8 + keywordScore + recency;
+    const trusted =
+      ["bbc","reuters","ap","the hindu","indian express"]
+        .some(s => a.source?.toLowerCase().includes(s));
+
+    const sourceScore = trusted ? 0.1 : 0;
+
+    const score = sim * 0.7 + keywordScore + recency + sourceScore;
 
     scored.push({ ...a, score });
   }
 
-  const top = scored;
+  scored.sort((a, b) => b.score - a.score);
+
+  const top = scored.slice(0, 5);
 
   const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
 
-  const confidence = Math.min(85, Math.round(avg * 100));
+  const confidence = Math.min(92, Math.round(avg * 100));
 
   let verdict = "Suspicious";
   if (confidence > 70) verdict = "Real";
@@ -205,7 +215,7 @@ async function analyze(text) {
     verdict,
     confidence,
     bias: detectBias(top),
-    reason: "Hybrid analysis (semantic + keyword + recency)",
+    reason: "Hybrid scoring: semantic + keyword + recency + trusted sources",
     sources: top.map(a => ({
       title: a.title,
       url: a.url,
@@ -238,7 +248,7 @@ app.post("/analyze", async (req, res) => {
     res.json(result);
 
   } catch (err) {
-    console.error("❌ SERVER ERROR:", err.message);
+    console.error("SERVER ERROR:", err.message);
 
     res.status(500).json({
       error: "Analysis failed",
@@ -247,9 +257,7 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-/* -------------------------
-   🚀 START
-------------------------- */
+/* ------------------------- */
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
