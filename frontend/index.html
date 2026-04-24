@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Veritas AI</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'Segoe UI', sans-serif;
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  color: white;
+}
+
+.container {
+  max-width: 900px;
+  margin: auto;
+  padding: 20px;
+  text-align: center;
+}
+
+h1 {
+  font-size: 2.5rem;
+  margin-bottom: 10px;
+}
+
+.subtitle {
+  opacity: 0.7;
+  margin-bottom: 20px;
+}
+
+input {
+  width: 100%;
+  padding: 15px;
+  border-radius: 12px;
+  border: none;
+  margin-top: 10px;
+  font-size: 16px;
+}
+
+button {
+  padding: 12px 20px;
+  border: none;
+  border-radius: 12px;
+  background: #6366f1;
+  color: white;
+  margin-top: 10px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+button:hover {
+  background: #4f46e5;
+}
+
+.card {
+  background: rgba(255,255,255,0.05);
+  backdrop-filter: blur(10px);
+  padding: 20px;
+  border-radius: 15px;
+  margin-top: 20px;
+  text-align: left;
+}
+
+.badges {
+  margin: 10px 0;
+}
+
+.badge {
+  padding: 6px 12px;
+  border-radius: 8px;
+  margin-right: 8px;
+  display: inline-block;
+}
+
+.real { background: #16a34a; }
+.fake { background: #dc2626; }
+.suspicious { background: #f59e0b; }
+
+.sources a {
+  color: #38bdf8;
+  text-decoration: none;
+}
+
+.sources a:hover {
+  text-decoration: underline;
+}
+
+.loading {
+  margin-top: 20px;
+  opacity: 0.7;
+}
+
+.error {
+  color: #f87171;
+  margin-top: 20px;
+}
+
+@media (max-width: 600px) {
+  h1 { font-size: 1.8rem; }
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <h1>🧠 Veritas AI</h1>
+  <p class="subtitle">Advanced Fake News Detection</p>
+
+  <input id="input" placeholder="Paste headline or full news article..." />
+  <button onclick="runAnalysis()">Analyze</button>
+
+  <div id="output"></div>
+</div>
+
+<script>
+const API = "https://workbysaksham.onrender.com"; // your backend
+
+async function runAnalysis() {
+  const input = document.getElementById("input").value.trim();
+  const output = document.getElementById("output");
+
+  if (!input) {
+    alert("Please enter news text");
+    return;
+  }
+
+  output.innerHTML = `<div class="loading">⏳ Analyzing...</div>`;
+
+  try {
+    const res = await fetch(API + "/analyze", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ text: input })
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.error || "API error");
+    }
+
+    const cls =
+      data.verdict === "Real" ? "real" :
+      data.verdict === "Fake" ? "fake" : "suspicious";
+
+    output.innerHTML = `
+      <div class="card">
+        <h2>${data.verdict}</h2>
+
+        <div class="badges">
+          <span class="badge ${cls}">Confidence: ${data.confidence}%</span>
+          <span class="badge">Agreement: ${data.agreement}%</span>
+          <span class="badge">Bias: ${data.bias}</span>
+        </div>
+
+        <p>${escapeHTML(data.reason)}</p>
+
+        <h3>🔎 Verify Yourself</h3>
+        <div class="sources">
+          ${data.sources && data.sources.length
+            ? data.sources.map(s =>
+              `<p><a href="${s.url}" target="_blank">${escapeHTML(s.title)}</a></p>`
+            ).join("")
+            : "<p>No sources available</p>"
+          }
+        </div>
+      </div>
+    `;
+
+  } catch (err) {
+    console.error(err);
+    output.innerHTML = `<div class="error">⚠️ Failed to analyze. Try again.</div>`;
+  }
+}
+
+// prevent XSS
+function escapeHTML(str) {
+  return str.replace(/[&<>"']/g, tag => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[tag]));
+}
+</script>
+
+</body>
+</html>
