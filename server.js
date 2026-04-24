@@ -5,76 +5,106 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const { GNEWS_API_KEY, MEDIASTACK_API_KEY } = process.env;
-
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -------------------------
-// 🔥 SMART KEYWORD EXTRACTION
-// -------------------------
+const { HF_API_KEY, GNEWS_API_KEY, MEDIASTACK_API_KEY } = process.env;
+
+/* -------------------------
+   🧠 EMBEDDING (HF)
+------------------------- */
+async function getEmbedding(text) {
+  const res = await fetch(
+    "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(text)
+    }
+  );
+
+  const data = await res.json();
+
+  // mean pooling
+  const vectors = data[0];
+  return vectors[0].map((_, i) =>
+    vectors.reduce((sum, v) => sum + v[i], 0) / vectors.length
+  );
+}
+
+/* -------------------------
+   📐 SIMILARITY
+------------------------- */
+function cosine(a, b) {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+/* -------------------------
+   🔑 KEYWORDS
+------------------------- */
 function extractKeywords(text) {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, "")
     .split(" ")
-    .filter(w =>
-      w.length > 3 &&
-      !["this","that","with","have","from","they","were","been","about"].includes(w)
-    )
+    .filter(w => w.length > 3)
     .slice(0, 6);
 }
 
-// -------------------------
-// FETCH NEWS (with sorting)
-// -------------------------
-async function fetchNews(query) {
-  const [gnews, mediastack] = await Promise.all([
-    fetch(`https://gnews.io/api/v4/search?q=${query}&max=20&lang=en&sortby=relevance&apikey=${GNEWS_API_KEY}`)
-      .then(r => r.json())
-      .then(d => d.articles || [])
-      .catch(() => []),
+/* -------------------------
+   🌐 FETCH NEWS (multi-query)
+------------------------- */
+async function fetchNews(text) {
+  const keywords = extractKeywords(text);
 
-    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&languages=en&limit=20&sort=published_desc`)
-      .then(r => r.json())
-      .then(d => d.data || [])
-      .catch(() => [])
-  ]);
+  const queries = [
+    keywords.join(" "),
+    keywords.slice(0, 3).join(" "),
+    text.slice(0, 80)
+  ];
 
-  return deduplicate([
-    ...normalizeGNews(gnews),
-    ...normalizeMediastack(mediastack)
-  ]);
-}
+  let results = [];
 
-// -------------------------
-function normalizeGNews(arr) {
-  return arr.map(a => ({
-    title: a.title || "",
-    description: a.description || "",
-    url: a.url,
-    source: a.source?.name || "Unknown",
-    publishedAt: new Date(a.publishedAt)
-  }));
-}
+  for (let q of queries) {
+    const [gnews, mediastack] = await Promise.all([
+      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
+        .then(r => r.json())
+        .then(d => d.articles || [])
+        .catch(() => []),
 
-function normalizeMediastack(arr) {
-  return arr.map(a => ({
-    title: a.title || "",
-    description: a.description || "",
-    url: a.url,
-    source: a.source || "Unknown",
-    publishedAt: new Date(a.published_at)
-  }));
-}
+      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5`)
+        .then(r => r.json())
+        .then(d => d.data || [])
+        .catch(() => [])
+    ]);
 
-// -------------------------
-// REMOVE DUPLICATES BETTER
-// -------------------------
-function deduplicate(arr) {
+    results.push(
+      ...gnews.map(a => ({
+        title: a.title,
+        desc: a.description,
+        url: a.url,
+        source: a.source?.name || "Unknown",
+        date: new Date(a.publishedAt)
+      })),
+      ...mediastack.map(a => ({
+        title: a.title,
+        desc: a.description,
+        url: a.url,
+        source: a.source,
+        date: new Date(a.published_at)
+      }))
+    );
+  }
+
+  // deduplicate
   const seen = new Set();
-  return arr.filter(a => {
+  return results.filter(a => {
     const key = a.title.toLowerCase().slice(0, 80);
     if (seen.has(key)) return false;
     seen.add(key);
@@ -82,111 +112,104 @@ function deduplicate(arr) {
   });
 }
 
-// -------------------------
-// 🔥 ADVANCED SCORING
-// -------------------------
-function score(article, keywords, input) {
-  const text = (article.title + " " + article.description).toLowerCase();
+/* -------------------------
+   🧭 BIAS DETECTION
+------------------------- */
+function detectBias(articles) {
+  const sources = articles.map(a => a.source.toLowerCase());
 
-  let score = 0;
+  const left = sources.filter(s =>
+    ["cnn","nytimes","guardian"].some(k => s.includes(k))
+  ).length;
 
-  // keyword match weight
-  keywords.forEach(k => {
-    if (text.includes(k)) score += 2;
-  });
+  const right = sources.filter(s =>
+    ["fox","dailywire","nypost"].some(k => s.includes(k))
+  ).length;
 
-  // phrase similarity
-  if (text.includes(input.toLowerCase().slice(0, 30))) {
-    score += 5;
+  if (left > right + 2) return "Left-leaning";
+  if (right > left + 2) return "Right-leaning";
+  return "Balanced / Mixed";
+}
+
+/* -------------------------
+   📊 HYBRID SCORING
+------------------------- */
+async function analyze(text) {
+  const articles = await fetchNews(text);
+
+  if (articles.length < 5) {
+    return {
+      verdict: "Suspicious",
+      confidence: 35,
+      bias: "Unknown",
+      reason: "Not enough coverage",
+      sources: []
+    };
   }
 
-  // recency boost (last 48h)
-  const hoursOld = (Date.now() - article.publishedAt) / (1000 * 60 * 60);
-  if (hoursOld < 48) score += 3;
+  const inputEmb = await getEmbedding(text);
 
-  return { ...article, score };
+  let scored = [];
+
+  for (let a of articles) {
+    const combined = a.title + " " + (a.desc || "");
+    const emb = await getEmbedding(combined);
+
+    const sim = cosine(inputEmb, emb);
+
+    // keyword overlap
+    const overlap = extractKeywords(text).filter(k =>
+      combined.toLowerCase().includes(k)
+    ).length;
+
+    // recency boost
+    const hours = (Date.now() - a.date) / (1000 * 60 * 60);
+    const recency = hours < 24 ? 0.1 : hours < 72 ? 0.05 : 0;
+
+    const score = sim * 0.7 + overlap * 0.05 + recency;
+
+    scored.push({ ...a, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const top = scored.slice(0, 6);
+
+  const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
+  const confidence = Math.min(95, Math.round(avg * 100));
+
+  let verdict = "Suspicious";
+  if (confidence > 70) verdict = "Real";
+  else if (confidence < 40) verdict = "Fake";
+
+  return {
+    verdict,
+    confidence,
+    bias: detectBias(top),
+    reason: "Analyzed using semantic similarity, recency, and multi-source agreement",
+    sources: top.map(a => ({
+      title: a.title,
+      url: a.url,
+      source: a.source
+    }))
+  };
 }
 
-// -------------------------
-// AGREEMENT CALCULATION
-// -------------------------
-function calculateAgreement(articles) {
-  const strong = articles.filter(a => a.score >= 6);
-  return Math.round((strong.length / articles.length) * 100);
-}
-
-// -------------------------
-function getVerdict(agreement) {
-  if (agreement > 75) return "Real";
-  if (agreement > 45) return "Suspicious";
-  return "Fake";
-}
-
-// -------------------------
-// ROUTE
-// -------------------------
+/* -------------------------
+   🚀 ROUTE
+------------------------- */
 app.post("/analyze", async (req, res) => {
-  const { text } = req.body;
-
-  if (!text) {
-    return res.status(400).json({ error: "No input" });
-  }
-
   try {
-    const keywords = extractKeywords(text);
-
-    const queries = [
-      keywords.join(" "),
-      keywords.slice(0, 3).join(" "),
-      text.slice(0, 80)
-    ];
-
-    const results = await Promise.all(queries.map(fetchNews));
-    let articles = deduplicate(results.flat());
-
-    // ❗ Filter weak articles early
-    articles = articles.filter(a => a.title.length > 30);
-
-    if (articles.length < 5) {
-      return res.json({
-        verdict: "Suspicious",
-        confidence: 35,
-        agreement: 25,
-        reason: "Not enough reliable coverage",
-        sources: []
-      });
-    }
-
-    // 🔥 SCORE + SORT PROPERLY
-    const scored = articles
-      .map(a => score(a, keywords, text))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 8);
-
-    const agreement = calculateAgreement(scored);
-
-    res.json({
-      verdict: getVerdict(agreement),
-      confidence: agreement,
-      agreement,
-      reason: "Cross-verified with multiple high-relevance sources",
-      sources: scored.map(a => ({
-        title: a.title,
-        url: a.url
-      }))
-    });
-
+    const result = await analyze(req.body.text);
+    res.json(result);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// -------------------------
 app.get("/", (req, res) => {
-  res.send("✅ Veritas AI running");
+  res.send("🚀 Veritas AI (Hybrid HF) Running");
 });
 
-// -------------------------
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Running on ${PORT}`));
+app.listen(10000, () => console.log("Running on 10000"));
