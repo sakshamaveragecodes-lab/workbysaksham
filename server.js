@@ -26,14 +26,15 @@ function extractKeywords(text) {
 }
 
 /* -------------------------
-   🌐 FETCH NEWS (ROBUST)
+   🌐 FETCH NEWS (MULTI QUERY)
 ------------------------- */
 async function fetchNews(text) {
   const keywords = extractKeywords(text);
+
   const queries = [
     keywords.join(" "),
     keywords.slice(0, 3).join(" "),
-    text.slice(0, 50)
+    text.slice(0, 60)
   ];
 
   let results = [];
@@ -56,18 +57,20 @@ async function fetchNews(text) {
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source?.name || "Unknown"
+        source: a.source?.name || "Unknown",
+        date: new Date(a.publishedAt)
       })),
       ...mediastack.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source
+        source: a.source,
+        date: new Date(a.published_at)
       }))
     );
   }
 
-  // dedupe
+  // remove duplicates
   const seen = new Set();
   return results.filter(a => {
     const key = a.title?.toLowerCase().slice(0, 80);
@@ -78,11 +81,33 @@ async function fetchNews(text) {
 }
 
 /* -------------------------
-   🧠 LLM (STRICT JSON MODE)
+   🧠 SAFE LLM (WITH TIMEOUT + FALLBACK)
 ------------------------- */
-async function runLLM(prompt) {
+async function factCheck(text, articles) {
+
+  const context = articles
+    .slice(0, 5)
+    .map((a, i) => `(${i + 1}) ${a.title}`)
+    .join("\n");
+
+  const prompt = `
+Fact check this claim:
+
+"${text}"
+
+Based on:
+${context}
+
+Return JSON:
+{
+ "verdict": "Real/Fake/Misleading/Unverified",
+ "confidence": number,
+ "reasoning": "short reason"
+}
+`;
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
     const res = await fetch(
@@ -95,7 +120,7 @@ async function runLLM(prompt) {
         },
         body: JSON.stringify({
           inputs: prompt,
-          parameters: { max_new_tokens: 200 }
+          parameters: { max_new_tokens: 150 }
         }),
         signal: controller.signal
       }
@@ -104,66 +129,30 @@ async function runLLM(prompt) {
     clearTimeout(timeout);
 
     const data = await res.json();
-    return data[0]?.generated_text || "";
+    const output = data[0]?.generated_text || "";
 
-  } catch {
-    return null;
-  }
-}
+    try {
+      return JSON.parse(output);
+    } catch {
+      return {
+        verdict: "Unverified",
+        confidence: 55,
+        reasoning: output.slice(0, 150) || "Model unclear"
+      };
+    }
 
-/* -------------------------
-   🧠 FACT CHECK CORE
-------------------------- */
-async function factCheck(text, articles) {
+  } catch (err) {
+    console.log("⚠️ HF failed → fallback");
 
-  const context = articles
-    .slice(0, 5)
-    .map((a, i) =>
-      `(${i + 1}) ${a.title} | ${a.source}`
-    )
-    .join("\n");
+    // 🔥 fallback logic
+    const trusted =
+      ["bbc","reuters","ap","the hindu","indian express"]
+        .some(s => articles[0]?.source?.toLowerCase().includes(s));
 
-  const prompt = `
-You are a professional fact checker.
-
-CLAIM:
-"${text}"
-
-EVIDENCE:
-${context}
-
-Return STRICT JSON:
-{
- "verdict": "Real or Fake or Misleading or Unverified",
- "confidence": number (0-100),
- "reasoning": "short explanation"
-}
-
-Rules:
-- Use evidence agreement
-- Penalize weak or single sources
-- Detect exaggeration
-- Be conservative if unsure
-`;
-
-  const output = await runLLM(prompt);
-
-  if (!output) {
     return {
-      verdict: "Unverified",
-      confidence: 40,
-      reasoning: "AI unavailable"
-    };
-  }
-
-  try {
-    const json = JSON.parse(output);
-    return json;
-  } catch {
-    return {
-      verdict: "Unverified",
-      confidence: 50,
-      reasoning: output.slice(0, 200)
+      verdict: trusted ? "Likely Real" : "Unverified",
+      confidence: trusted ? 60 : 40,
+      reasoning: "Fallback used due to AI failure"
     };
   }
 }
@@ -172,7 +161,6 @@ Rules:
    📊 ANALYZE
 ------------------------- */
 async function analyze(text) {
-
   const articles = await fetchNews(text);
 
   if (articles.length === 0) {
@@ -196,7 +184,7 @@ async function analyze(text) {
    🚀 ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Hybrid V3 Running");
+  res.send("🚀 Hybrid Stable Fact Checker Running");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -204,16 +192,27 @@ app.post("/analyze", async (req, res) => {
     const { text } = req.body;
 
     if (!text) {
-      return res.status(400).json({ error: "No input" });
+      return res.json({
+        verdict: "Unverified",
+        confidence: 20,
+        reasoning: "No input provided",
+        sources: []
+      });
     }
 
     const result = await analyze(text);
+
+    // 🔥 ALWAYS RETURN SUCCESS
     res.json(result);
 
   } catch (err) {
-    res.status(500).json({
-      error: "Failed",
-      details: err.message
+    console.error("ERROR:", err.message);
+
+    res.json({
+      verdict: "Unverified",
+      confidence: 30,
+      reasoning: "Server fallback triggered",
+      sources: []
     });
   }
 });
@@ -222,5 +221,5 @@ app.post("/analyze", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(`Running on ${PORT}`);
+  console.log(`🔥 Running on ${PORT}`);
 });
