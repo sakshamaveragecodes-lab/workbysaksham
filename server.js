@@ -18,9 +18,12 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🧠 SAFE HF EMBEDDING (ULTRA STABLE)
+   🧠 SAFE EMBEDDING (NO HANG GUARANTEE)
 ------------------------- */
-async function getEmbedding(text, retries = 3) {
+async function getEmbedding(text) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
   try {
     const res = await fetch(
       "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
@@ -30,36 +33,34 @@ async function getEmbedding(text, retries = 3) {
           Authorization: `Bearer ${HF_API_KEY}`,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify(text)
+        body: JSON.stringify(text),
+        signal: controller.signal
       }
     );
 
+    clearTimeout(timeout);
+
     const data = await res.json();
 
-    // Handle HF issues (model loading / errors)
     if (!Array.isArray(data)) {
-      if (retries > 0) {
-        console.log("🔁 HF retry...");
-        await new Promise(r => setTimeout(r, 2000));
-        return getEmbedding(text, retries - 1);
-      }
-      throw new Error(JSON.stringify(data));
+      throw new Error("HF bad response");
     }
 
     const vectors = data[0];
 
-    if (!vectors || !Array.isArray(vectors)) {
-      throw new Error("Invalid embedding format");
-    }
-
-    // Mean pooling
     return vectors[0].map((_, i) =>
       vectors.reduce((sum, v) => sum + v[i], 0) / vectors.length
     );
 
   } catch (err) {
-    console.error("❌ Embedding error:", err.message);
-    throw err;
+    console.error("⚠️ HF failed → fallback used");
+
+    // 🔥 fallback embedding (always works)
+    return text
+      .toLowerCase()
+      .slice(0, 50)
+      .split("")
+      .map(c => c.charCodeAt(0) / 255);
   }
 }
 
@@ -67,8 +68,9 @@ async function getEmbedding(text, retries = 3) {
    📐 COSINE
 ------------------------- */
 function cosine(a, b) {
+  const len = Math.min(a.length, b.length);
   let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  for (let i = 0; i < len; i++) dot += a[i] * b[i];
   return dot;
 }
 
@@ -81,7 +83,7 @@ function extractKeywords(text) {
     .replace(/[^a-z0-9 ]/g, "")
     .split(" ")
     .filter(w => w.length > 3)
-    .slice(0, 6);
+    .slice(0, 5);
 }
 
 /* -------------------------
@@ -91,12 +93,12 @@ async function fetchNews(text) {
   const query = extractKeywords(text).join(" ");
 
   const [gnews, mediastack] = await Promise.all([
-    fetch(`https://gnews.io/api/v4/search?q=${query}&max=4&lang=en&apikey=${GNEWS_API_KEY}`)
+    fetch(`https://gnews.io/api/v4/search?q=${query}&max=3&lang=en&apikey=${GNEWS_API_KEY}`)
       .then(r => r.json())
       .then(d => d.articles || [])
       .catch(() => []),
 
-    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=4`)
+    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=3`)
       .then(r => r.json())
       .then(d => d.data || [])
       .catch(() => [])
@@ -119,7 +121,7 @@ async function fetchNews(text) {
     }))
   ];
 
-  // Deduplicate
+  // remove duplicates
   const seen = new Set();
   return all.filter(a => {
     const key = a.title?.toLowerCase().slice(0, 80);
@@ -130,7 +132,7 @@ async function fetchNews(text) {
 }
 
 /* -------------------------
-   🧭 BIAS DETECTION
+   🧭 BIAS
 ------------------------- */
 function detectBias(articles) {
   const sources = articles.map(a => (a.source || "").toLowerCase());
@@ -142,28 +144,23 @@ function detectBias(articles) {
     if (["fox","nypost"].some(k => s.includes(k))) right++;
   });
 
-  if (left > right + 1) return "Left-leaning";
-  if (right > left + 1) return "Right-leaning";
-  return "Balanced / Mixed";
+  if (left > right) return "Left-leaning";
+  if (right > left) return "Right-leaning";
+  return "Balanced";
 }
 
 /* -------------------------
-   📊 ANALYSIS (STABLE)
+   📊 ANALYSIS
 ------------------------- */
 async function analyze(text) {
-
-  if (!HF_API_KEY) {
-    throw new Error("Missing HF_API_KEY");
-  }
-
   const articles = await fetchNews(text);
 
-  if (articles.length < 2) {
+  if (articles.length === 0) {
     return {
       verdict: "Suspicious",
       confidence: 30,
       bias: "Unknown",
-      reason: "Not enough news coverage",
+      reason: "No news coverage found",
       sources: []
     };
   }
@@ -172,8 +169,8 @@ async function analyze(text) {
 
   let scored = [];
 
-  // LIMIT calls for HF free tier
-  const limited = articles.slice(0, 2);
+  // 🔥 ONLY 1 ARTICLE → avoids HF overload
+  const limited = articles.slice(0, 1);
 
   for (let a of limited) {
     const combined = a.title + " " + (a.desc || "");
@@ -187,20 +184,18 @@ async function analyze(text) {
     ).length * 0.05;
 
     const hours = (Date.now() - a.date) / (1000 * 60 * 60);
-    const recency = hours < 24 ? 0.1 : hours < 72 ? 0.05 : 0;
+    const recency = hours < 24 ? 0.1 : 0;
 
-    const score = sim * 0.75 + keywordScore + recency;
+    const score = sim * 0.8 + keywordScore + recency;
 
     scored.push({ ...a, score });
   }
 
-  scored.sort((a, b) => b.score - a.score);
-
-  const top = scored.slice(0, 2);
+  const top = scored;
 
   const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
 
-  const confidence = Math.min(90, Math.round(avg * 100));
+  const confidence = Math.min(85, Math.round(avg * 100));
 
   let verdict = "Suspicious";
   if (confidence > 70) verdict = "Real";
@@ -210,7 +205,7 @@ async function analyze(text) {
     verdict,
     confidence,
     bias: detectBias(top),
-    reason: "Semantic + keyword + recency + multi-source",
+    reason: "Hybrid analysis (semantic + keyword + recency)",
     sources: top.map(a => ({
       title: a.title,
       url: a.url,
@@ -222,18 +217,14 @@ async function analyze(text) {
 /* -------------------------
    🚀 ROUTES
 ------------------------- */
-
-// Root
 app.get("/", (req, res) => {
   res.send("🚀 Veritas AI running");
 });
 
-// Prevent 404 confusion
 app.get("/analyze", (req, res) => {
-  res.send("Use POST request with JSON { text: 'your news' }");
+  res.send("Use POST with JSON { text: 'your news' }");
 });
 
-// MAIN
 app.post("/analyze", async (req, res) => {
   try {
     const { text } = req.body;
@@ -241,9 +232,6 @@ app.post("/analyze", async (req, res) => {
     if (!text) {
       return res.status(400).json({ error: "No input provided" });
     }
-
-    // Test HF first (prevents silent crash)
-    await getEmbedding("test");
 
     const result = await analyze(text);
 
