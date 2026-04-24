@@ -8,7 +8,7 @@ dotenv.config();
 const app = express();
 
 /* -------------------------
-   ✅ MIDDLEWARE (RENDER SAFE)
+   ✅ MIDDLEWARE
 ------------------------- */
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "1mb" }));
@@ -18,7 +18,7 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🧠 SAFE EMBEDDING (HF)
+   🧠 SAFE HF EMBEDDING (ULTRA STABLE)
 ------------------------- */
 async function getEmbedding(text, retries = 3) {
   try {
@@ -36,13 +36,14 @@ async function getEmbedding(text, retries = 3) {
 
     const data = await res.json();
 
-    // Handle HF errors
+    // Handle HF issues (model loading / errors)
     if (!Array.isArray(data)) {
       if (retries > 0) {
+        console.log("🔁 HF retry...");
         await new Promise(r => setTimeout(r, 2000));
         return getEmbedding(text, retries - 1);
       }
-      throw new Error("HF API error: " + JSON.stringify(data));
+      throw new Error(JSON.stringify(data));
     }
 
     const vectors = data[0];
@@ -57,24 +58,22 @@ async function getEmbedding(text, retries = 3) {
     );
 
   } catch (err) {
-    console.error("Embedding error:", err.message);
+    console.error("❌ Embedding error:", err.message);
     throw err;
   }
 }
 
 /* -------------------------
-   📐 COSINE SIMILARITY
+   📐 COSINE
 ------------------------- */
 function cosine(a, b) {
   let dot = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-  }
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot;
 }
 
 /* -------------------------
-   🔑 KEYWORD EXTRACTION
+   🔑 KEYWORDS
 ------------------------- */
 function extractKeywords(text) {
   return text
@@ -89,16 +88,15 @@ function extractKeywords(text) {
    🌐 FETCH NEWS
 ------------------------- */
 async function fetchNews(text) {
-  const keywords = extractKeywords(text);
-  const query = keywords.join(" ");
+  const query = extractKeywords(text).join(" ");
 
   const [gnews, mediastack] = await Promise.all([
-    fetch(`https://gnews.io/api/v4/search?q=${query}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
+    fetch(`https://gnews.io/api/v4/search?q=${query}&max=4&lang=en&apikey=${GNEWS_API_KEY}`)
       .then(r => r.json())
       .then(d => d.articles || [])
       .catch(() => []),
 
-    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=5`)
+    fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=4`)
       .then(r => r.json())
       .then(d => d.data || [])
       .catch(() => [])
@@ -140,8 +138,8 @@ function detectBias(articles) {
   let left = 0, right = 0;
 
   sources.forEach(s => {
-    if (["cnn","nytimes","guardian","bbc"].some(k => s.includes(k))) left++;
-    if (["fox","nypost","dailywire"].some(k => s.includes(k))) right++;
+    if (["cnn","bbc","guardian"].some(k => s.includes(k))) left++;
+    if (["fox","nypost"].some(k => s.includes(k))) right++;
   });
 
   if (left > right + 1) return "Left-leaning";
@@ -150,7 +148,7 @@ function detectBias(articles) {
 }
 
 /* -------------------------
-   📊 ANALYSIS
+   📊 ANALYSIS (STABLE)
 ------------------------- */
 async function analyze(text) {
 
@@ -160,12 +158,12 @@ async function analyze(text) {
 
   const articles = await fetchNews(text);
 
-  if (articles.length < 3) {
+  if (articles.length < 2) {
     return {
       verdict: "Suspicious",
       confidence: 30,
       bias: "Unknown",
-      reason: "Low coverage across sources",
+      reason: "Not enough news coverage",
       sources: []
     };
   }
@@ -174,7 +172,8 @@ async function analyze(text) {
 
   let scored = [];
 
-  const limited = articles.slice(0, 5);
+  // LIMIT calls for HF free tier
+  const limited = articles.slice(0, 2);
 
   for (let a of limited) {
     const combined = a.title + " " + (a.desc || "");
@@ -197,7 +196,7 @@ async function analyze(text) {
 
   scored.sort((a, b) => b.score - a.score);
 
-  const top = scored.slice(0, 4);
+  const top = scored.slice(0, 2);
 
   const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
 
@@ -211,7 +210,7 @@ async function analyze(text) {
     verdict,
     confidence,
     bias: detectBias(top),
-    reason: "Semantic similarity + keyword + recency + multi-source agreement",
+    reason: "Semantic + keyword + recency + multi-source",
     sources: top.map(a => ({
       title: a.title,
       url: a.url,
@@ -224,17 +223,17 @@ async function analyze(text) {
    🚀 ROUTES
 ------------------------- */
 
-// Root check
+// Root
 app.get("/", (req, res) => {
-  res.send("🚀 Veritas AI running on Render");
+  res.send("🚀 Veritas AI running");
 });
 
-// Fix "Cannot GET /analyze"
+// Prevent 404 confusion
 app.get("/analyze", (req, res) => {
-  res.send("Use POST with JSON { text: 'your news' }");
+  res.send("Use POST request with JSON { text: 'your news' }");
 });
 
-// MAIN ROUTE
+// MAIN
 app.post("/analyze", async (req, res) => {
   try {
     const { text } = req.body;
@@ -243,12 +242,16 @@ app.post("/analyze", async (req, res) => {
       return res.status(400).json({ error: "No input provided" });
     }
 
+    // Test HF first (prevents silent crash)
+    await getEmbedding("test");
+
     const result = await analyze(text);
 
     res.json(result);
 
   } catch (err) {
-    console.error("SERVER ERROR:", err.message);
+    console.error("❌ SERVER ERROR:", err.message);
+
     res.status(500).json({
       error: "Analysis failed",
       details: err.message
@@ -257,7 +260,7 @@ app.post("/analyze", async (req, res) => {
 });
 
 /* -------------------------
-   🚀 START SERVER
+   🚀 START
 ------------------------- */
 const PORT = process.env.PORT || 10000;
 
