@@ -6,66 +6,16 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-
 app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
 const HF_API_KEY = process.env.HF_API_KEY;
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🧠 EMBEDDING (SAFE + FALLBACK)
+   🔑 KEYWORDS
 ------------------------- */
-async function getEmbedding(text) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const res = await fetch(
-      "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${HF_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(text),
-        signal: controller.signal
-      }
-    );
-
-    clearTimeout(timeout);
-
-    const data = await res.json();
-
-    if (!Array.isArray(data)) throw new Error("HF failed");
-
-    const vectors = data[0];
-
-    return vectors[0].map((_, i) =>
-      vectors.reduce((sum, v) => sum + v[i], 0) / vectors.length
-    );
-
-  } catch {
-    // fallback embedding
-    return text
-      .toLowerCase()
-      .slice(0, 60)
-      .split("")
-      .map(c => c.charCodeAt(0) / 255);
-  }
-}
-
-/* ------------------------- */
-function cosine(a, b) {
-  const len = Math.min(a.length, b.length);
-  let dot = 0;
-  for (let i = 0; i < len; i++) dot += a[i] * b[i];
-  return dot;
-}
-
-/* ------------------------- */
 function extractKeywords(text) {
   return text
     .toLowerCase()
@@ -76,27 +26,26 @@ function extractKeywords(text) {
 }
 
 /* -------------------------
-   🌐 FETCH NEWS (MULTI QUERY)
+   🌐 FETCH NEWS (ROBUST)
 ------------------------- */
 async function fetchNews(text) {
   const keywords = extractKeywords(text);
-
   const queries = [
     keywords.join(" "),
     keywords.slice(0, 3).join(" "),
-    text.slice(0, 60)
+    text.slice(0, 50)
   ];
 
   let results = [];
 
   for (let q of queries) {
     const [gnews, mediastack] = await Promise.all([
-      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&sortby=relevance&apikey=${GNEWS_API_KEY}`)
+      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
         .then(r => r.json())
         .then(d => d.articles || [])
         .catch(() => []),
 
-      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5&sort=published_desc`)
+      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5`)
         .then(r => r.json())
         .then(d => d.data || [])
         .catch(() => [])
@@ -107,20 +56,18 @@ async function fetchNews(text) {
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source?.name || "Unknown",
-        date: new Date(a.publishedAt)
+        source: a.source?.name || "Unknown"
       })),
       ...mediastack.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source,
-        date: new Date(a.published_at)
+        source: a.source
       }))
     );
   }
 
-  // deduplicate
+  // dedupe
   const seen = new Set();
   return results.filter(a => {
     const key = a.title?.toLowerCase().slice(0, 80);
@@ -131,141 +78,117 @@ async function fetchNews(text) {
 }
 
 /* -------------------------
-   🧭 BIAS DETECTION
+   🧠 LLM (STRICT JSON MODE)
 ------------------------- */
-function detectBias(articles) {
-  const sources = articles.map(a => (a.source || "").toLowerCase());
+async function runLLM(prompt) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
 
-  let left = 0, right = 0;
+  try {
+    const res = await fetch(
+      "https://api-inference.huggingface.co/models/google/flan-t5-large",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${HF_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: { max_new_tokens: 200 }
+        }),
+        signal: controller.signal
+      }
+    );
 
-  sources.forEach(s => {
-    if (["cnn","bbc","guardian"].some(k => s.includes(k))) left++;
-    if (["fox","nypost"].some(k => s.includes(k))) right++;
-  });
+    clearTimeout(timeout);
 
-  if (left > right + 1) return "Left-leaning";
-  if (right > left + 1) return "Right-leaning";
-  return "Balanced / Mixed";
+    const data = await res.json();
+    return data[0]?.generated_text || "";
+
+  } catch {
+    return null;
+  }
 }
 
 /* -------------------------
-   📊 ANALYSIS (DUAL MODE)
+   🧠 FACT CHECK CORE
 ------------------------- */
-async function analyze(text) {
-  const articles = await fetchNews(text);
-  const keywords = extractKeywords(text);
+async function factCheck(text, articles) {
 
-  /* -------------------------
-     🟢 HIGH COVERAGE MODE
-  ------------------------- */
-  if (articles.length >= 3) {
+  const context = articles
+    .slice(0, 5)
+    .map((a, i) =>
+      `(${i + 1}) ${a.title} | ${a.source}`
+    )
+    .join("\n");
 
-    const inputEmb = await getEmbedding(text);
+  const prompt = `
+You are a professional fact checker.
 
-    let scored = [];
+CLAIM:
+"${text}"
 
-    const limited = articles.slice(0, 4);
+EVIDENCE:
+${context}
 
-    for (let a of limited) {
-      const combined = a.title + " " + (a.desc || "");
+Return STRICT JSON:
+{
+ "verdict": "Real or Fake or Misleading or Unverified",
+ "confidence": number (0-100),
+ "reasoning": "short explanation"
+}
 
-      const emb = await getEmbedding(combined);
+Rules:
+- Use evidence agreement
+- Penalize weak or single sources
+- Detect exaggeration
+- Be conservative if unsure
+`;
 
-      const sim = cosine(inputEmb, emb);
+  const output = await runLLM(prompt);
 
-      const keywordScore = keywords.filter(k =>
-        combined.toLowerCase().includes(k)
-      ).length * 0.05;
-
-      const hours = (Date.now() - a.date) / (1000 * 60 * 60);
-      const recency = hours < 24 ? 0.1 : hours < 72 ? 0.05 : 0;
-
-      const trusted =
-        ["bbc","reuters","ap","the hindu","indian express"]
-          .some(s => a.source?.toLowerCase().includes(s));
-
-      const sourceScore = trusted ? 0.1 : 0;
-
-      const score = sim * 0.7 + keywordScore + recency + sourceScore;
-
-      scored.push({ ...a, score });
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-
-    const top = scored.slice(0, 5);
-
-    const avg = top.reduce((s, a) => s + a.score, 0) / top.length;
-
-    const confidence = Math.min(92, Math.round(avg * 100));
-
-    let verdict = "Suspicious";
-    if (confidence > 70) verdict = "Real";
-    else if (confidence < 40) verdict = "Fake";
-
+  if (!output) {
     return {
-      verdict,
-      confidence,
-      bias: detectBias(top),
-      reason: "Multi-source verification (high coverage)",
-      sources: top.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source
-      }))
+      verdict: "Unverified",
+      confidence: 40,
+      reasoning: "AI unavailable"
     };
   }
 
-  /* -------------------------
-     🔴 LOW COVERAGE MODE
-  ------------------------- */
-  const article = articles[0];
-
-  if (!article) {
+  try {
+    const json = JSON.parse(output);
+    return json;
+  } catch {
     return {
-      verdict: "Unknown",
+      verdict: "Unverified",
+      confidence: 50,
+      reasoning: output.slice(0, 200)
+    };
+  }
+}
+
+/* -------------------------
+   📊 ANALYZE
+------------------------- */
+async function analyze(text) {
+
+  const articles = await fetchNews(text);
+
+  if (articles.length === 0) {
+    return {
+      verdict: "Unverified",
       confidence: 20,
-      bias: "Unknown",
-      reason: "No news found anywhere",
+      reasoning: "No sources found",
       sources: []
     };
   }
 
-  const combined = article.title + " " + (article.desc || "");
-
-  const keywordMatch = keywords.filter(k =>
-    combined.toLowerCase().includes(k)
-  ).length;
-
-  const trusted =
-    ["bbc","reuters","ap","the hindu","indian express"]
-      .some(s => article.source?.toLowerCase().includes(s));
-
-  const clickbait =
-    /shocking|breaking|you won’t believe|viral|must see/i.test(combined);
-
-  let confidence = 40;
-
-  if (trusted) confidence += 20;
-  if (keywordMatch > 2) confidence += 15;
-  if (clickbait) confidence -= 15;
-
-  confidence = Math.max(20, Math.min(75, confidence));
-
-  let verdict = "Unverified";
-  if (confidence > 60) verdict = "Likely Real";
-  if (confidence < 35) verdict = "Possibly Fake";
+  const result = await factCheck(text, articles);
 
   return {
-    verdict,
-    confidence,
-    bias: detectBias([article]),
-    reason: "Low coverage: source credibility + content analysis",
-    sources: [{
-      title: article.title,
-      url: article.url,
-      source: article.source
-    }]
+    ...result,
+    sources: articles.slice(0, 5)
   };
 }
 
@@ -273,11 +196,7 @@ async function analyze(text) {
    🚀 ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Veritas AI running");
-});
-
-app.get("/analyze", (req, res) => {
-  res.send("Use POST with JSON { text: 'your news' }");
+  res.send("🚀 Hybrid V3 Running");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -285,18 +204,15 @@ app.post("/analyze", async (req, res) => {
     const { text } = req.body;
 
     if (!text) {
-      return res.status(400).json({ error: "No input provided" });
+      return res.status(400).json({ error: "No input" });
     }
 
     const result = await analyze(text);
-
     res.json(result);
 
   } catch (err) {
-    console.error("SERVER ERROR:", err.message);
-
     res.status(500).json({
-      error: "Analysis failed",
+      error: "Failed",
       details: err.message
     });
   }
@@ -306,5 +222,5 @@ app.post("/analyze", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(`🔥 Running on ${PORT}`);
+  console.log(`Running on ${PORT}`);
 });
