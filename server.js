@@ -9,8 +9,17 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-
 const cache = new Map();
+
+/* ---------------- QUERY NORMALIZATION ---------------- */
+function normalizeQuery(q) {
+  return q
+    .toLowerCase()
+    .replace(/\busa\b/g, "us")
+    .replace(/\buk\b/g, "united kingdom")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 /* ---------------- FETCH: GNEWS ---------------- */
 async function fetchGNews(query) {
@@ -24,7 +33,6 @@ async function fetchGNews(query) {
       url: a.url,
       source: a.source.name
     })) || [];
-
   } catch {
     return [];
   }
@@ -42,7 +50,30 @@ async function fetchMediastack(query) {
       url: a.url,
       source: a.source
     })) || [];
+  } catch {
+    return [];
+  }
+}
 
+/* ---------------- FETCH: GOOGLE RSS (FALLBACK) ---------------- */
+async function fetchGoogle(query) {
+  try {
+    const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-IN&gl=IN&ceid=IN:en`;
+    const res = await fetch(url);
+    const xml = await res.text();
+
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
+
+    return items.map(i => {
+      const block = i[1];
+      const title = (block.match(/<title>(.*?)<\/title>/)?.[1] || "")
+        .replace(/<!\[CDATA\[|\]\]>/g, "");
+
+      const link = block.match(/<link>(.*?)<\/link>/)?.[1] || "";
+      const source = title.split(" - ").pop();
+
+      return { title, url: link, source };
+    });
   } catch {
     return [];
   }
@@ -58,7 +89,6 @@ function relevanceScore(query, title) {
   const t = words(title);
 
   let score = 0;
-
   q.forEach(w => {
     if (t.includes(w)) score += 2;
   });
@@ -66,21 +96,25 @@ function relevanceScore(query, title) {
   return score / (t.length || 1);
 }
 
-/* ---------------- SOURCE SCORE ---------------- */
+/* ---------------- SOURCE SCORING ---------------- */
 function sourceScore(source) {
   const s = source.toLowerCase();
 
-  if (["reuters","bbc","associated press"].some(x => s.includes(x))) return 4;
-  if (["the hindu","indian express"].some(x => s.includes(x))) return 3;
-  if (["ndtv","times of india"].some(x => s.includes(x))) return 2;
+  if (["reuters","bbc","associated press"].some(x => s.includes(x)))
+    return { score: 4, tag: "Trusted" };
 
-  return 1;
+  if (["the hindu","indian express"].some(x => s.includes(x)))
+    return { score: 3, tag: "Credible" };
+
+  if (["ndtv","times of india"].some(x => s.includes(x)))
+    return { score: 2, tag: "Mixed" };
+
+  return { score: 1, tag: "Low" };
 }
 
-/* ---------------- NOISE FILTER ---------------- */
+/* ---------------- PENALTY ---------------- */
 function penalty(title) {
   const t = title.toLowerCase();
-
   let p = 0;
 
   if (["celebrity","movie","review"].some(w => t.includes(w))) p += 3;
@@ -89,16 +123,14 @@ function penalty(title) {
   return p;
 }
 
-/* ---------------- SIMILARITY ---------------- */
+/* ---------------- SIMILARITY + CLUSTER ---------------- */
 function similarity(a, b) {
   const w1 = words(a);
   const w2 = words(b);
-
   const common = w1.filter(w => w2.includes(w)).length;
   return common / Math.max(w1.length, 1);
 }
 
-/* ---------------- CLUSTER ---------------- */
 function cluster(articles) {
   const clusters = [];
 
@@ -129,12 +161,12 @@ function stance(title) {
   return 0;
 }
 
-/* ---------------- MAIN ANALYSIS ---------------- */
+/* ---------------- ANALYSIS ---------------- */
 function analyze(query, articles) {
 
   if (!articles.length) {
     return {
-      verdict: "Unverified",
+      verdict: "Unverified ❓",
       confidence: 20,
       reasoning: "No coverage found",
       sources: []
@@ -143,15 +175,24 @@ function analyze(query, articles) {
 
   const ranked = articles.map(a => {
     const relevance = relevanceScore(query, a.title);
-    const cred = sourceScore(a.source);
+    const { score: cred, tag } = sourceScore(a.source);
     const pen = penalty(a.title);
 
     const score = (relevance * 10) + cred - pen;
 
-    return { ...a, score, relevance, cred };
+    return { ...a, score, relevance, cred, tag };
   })
-  .filter(a => a.relevance > 0.15)
+  .filter(a => a.relevance > 0.08)
   .sort((a, b) => b.score - a.score);
+
+  if (!ranked.length) {
+    return {
+      verdict: "Unverified ❓",
+      confidence: 25,
+      reasoning: "Weak relevance",
+      sources: []
+    };
+  }
 
   const clusters = cluster(ranked);
   const main = clusters[0];
@@ -160,29 +201,38 @@ function analyze(query, articles) {
   const avgCred = main.reduce((s, a) => s + a.cred, 0) / coverage;
   const agreement = Math.abs(main.reduce((s, a) => s + stance(a.title), 0));
 
-  if (coverage < 3 || avgCred < 2) {
+  if (coverage >= 5 && avgCred >= 2.5 && agreement >= coverage * 0.5) {
     return {
-      verdict: "Possibly Misleading",
-      confidence: 35,
-      reasoning: "Low coverage or weak sources",
-      sources: main.slice(0, 6)
+      verdict: "Verified ✅",
+      confidence: Math.min(95, Math.round((coverage * 12) + (avgCred * 10))),
+      reasoning: "Strong agreement across trusted sources",
+      sources: main.slice(0, 8)
     };
   }
 
   if (agreement < coverage * 0.3) {
     return {
-      verdict: "Unverified",
-      confidence: 45,
-      reasoning: "Conflicting reports",
+      verdict: "Conflicting ⚠️",
+      confidence: 50,
+      reasoning: "Sources disagree",
       sources: main.slice(0, 6)
     };
   }
 
+  if (coverage < 3) {
+    return {
+      verdict: "Unverified ❓",
+      confidence: 30,
+      reasoning: "Low coverage",
+      sources: main.slice(0, 5)
+    };
+  }
+
   return {
-    verdict: "Likely Real",
-    confidence: Math.min(95, Math.round((coverage * 12) + (avgCred * 10))),
-    reasoning: "Strong agreement across multiple sources",
-    sources: main.slice(0, 8)
+    verdict: "Possibly Misleading 🚨",
+    confidence: 40,
+    reasoning: "Weak or low credibility reporting",
+    sources: main.slice(0, 6)
   };
 }
 
@@ -190,43 +240,42 @@ function analyze(query, articles) {
 app.post("/analyze", async (req, res) => {
   try {
     const { text } = req.body;
-
     if (!text) {
       return res.json({
-        verdict: "Unverified",
+        verdict: "Unverified ❓",
         confidence: 0,
         reasoning: "Empty input",
         sources: []
       });
     }
 
-    if (cache.has(text)) {
-      return res.json(cache.get(text));
-    }
+    if (cache.has(text)) return res.json(cache.get(text));
 
-    const [gnews, mediastack] = await Promise.all([
-      fetchGNews(text),
-      fetchMediastack(text)
+    const query = normalizeQuery(text);
+
+    const [gnews, mediastack, google] = await Promise.all([
+      fetchGNews(query),
+      fetchMediastack(query),
+      fetchGoogle(query)
     ]);
 
-    const allArticles = [...gnews, ...mediastack];
+    const all = [...gnews, ...mediastack, ...google];
 
-    const result = analyze(text, allArticles);
+    const result = analyze(query, all);
 
     cache.set(text, result);
-
     res.json(result);
 
   } catch (err) {
     res.json({
-      verdict: "Unverified",
+      verdict: "Unverified ❓",
       confidence: 10,
-      reasoning: "Server error fallback",
+      reasoning: "Server error",
       sources: []
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log("🚀 Veritas AI (GNews + Mediastack) running");
+  console.log("🚀 Veritas AI ELITE running");
 });

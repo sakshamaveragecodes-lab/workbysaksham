@@ -1,6 +1,6 @@
 {
   "name": "veritas-ai-pro",
-  "version": "10.0.0",
+  "version": "11.0.0",
   "type": "module",
   "scripts": {
     "start": "node server.js"
