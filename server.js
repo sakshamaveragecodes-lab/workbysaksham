@@ -10,145 +10,126 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
-const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
-
 /* -------------------------
-   CLEAN + KEYWORDS
+   CLEAN TEXT
 ------------------------- */
-const STOPWORDS = new Set([
-  "the","is","in","on","at","of","and","a","to","for","with","by","an",
-  "has","have","had","will","be","was","were"
-]);
-
 function clean(text) {
   return text.toLowerCase().replace(/[^a-z0-9 ]/g, "");
 }
 
-function keywords(text) {
-  return clean(text)
-    .split(" ")
-    .filter(w => w && !STOPWORDS.has(w));
-}
-
 /* -------------------------
-   MATCH SCORE (STRICT)
+   FETCH FROM GNEWS
 ------------------------- */
-function score(queryWords, titleWords) {
-  let match = 0;
-
-  queryWords.forEach(w => {
-    if (titleWords.includes(w)) match++;
-  });
-
-  return match;
-}
-
-/* -------------------------
-   FETCH NEWS
-------------------------- */
-async function fetchNews(query) {
+async function fetchGNews(query) {
   try {
-    const gURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
-    const mURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&limit=10`;
+    const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${process.env.GNEWS_API_KEY}`;
 
-    const [gRes, mRes] = await Promise.all([
-      fetch(gURL),
-      fetch(mURL)
-    ]);
+    const res = await fetch(url);
+    const data = await res.json();
 
-    const gData = await gRes.json();
-    const mData = await mRes.json();
+    if (!data.articles) return [];
 
-    let articles = [];
-
-    if (gData.articles) {
-      articles.push(...gData.articles.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source?.name || "GNews"
-      })));
-    }
-
-    if (mData.data) {
-      articles.push(...mData.data.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source || "Mediastack"
-      })));
-    }
-
-    // remove duplicates
-    const seen = new Set();
-    return articles.filter(a => {
-      const key = clean(a.title);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    return data.articles.map(a => ({
+      title: a.title,
+      url: a.url,
+      source: a.source?.name || "GNews"
+    }));
 
   } catch (err) {
-    console.error(err);
+    console.log("GNews error:", err.message);
     return [];
   }
 }
 
 /* -------------------------
-   FILTER + RANK
+   FETCH FROM MEDIASTACK
+------------------------- */
+async function fetchMediastack(query) {
+  try {
+    const url = `http://api.mediastack.com/v1/news?access_key=${process.env.MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&limit=10`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (!data.data) return [];
+
+    return data.data.map(a => ({
+      title: a.title,
+      url: a.url,
+      source: a.source || "Mediastack"
+    }));
+
+  } catch (err) {
+    console.log("Mediastack error:", err.message);
+    return [];
+  }
+}
+
+/* -------------------------
+   MERGE + REMOVE DUPLICATES
+------------------------- */
+function mergeArticles(a1, a2) {
+  const seen = new Set();
+
+  return [...a1, ...a2].filter(a => {
+    const key = clean(a.title);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/* -------------------------
+   FILTER RELEVANCE
 ------------------------- */
 function filterArticles(query, articles) {
-  const qWords = keywords(query);
+  const words = clean(query).split(" ");
 
   return articles
     .map(a => {
-      const tWords = keywords(a.title);
-      const s = score(qWords, tWords);
+      let match = 0;
+      words.forEach(w => {
+        if (a.title.toLowerCase().includes(w)) match++;
+      });
 
-      return { ...a, score: s };
+      return { ...a, score: match };
     })
-    // MUST match at least 2 important words
-    .filter(a => a.score >= Math.max(2, Math.ceil(qWords.length * 0.5)))
+    .filter(a => a.score >= Math.min(2, words.length))
     .sort((a, b) => b.score - a.score);
 }
 
 /* -------------------------
-   ANALYSIS
+   ANALYSIS (UI SAFE)
 ------------------------- */
 function analyze(query, articles) {
+
   if (!articles.length) {
     return {
       verdict: "Unverified",
-      confidence: 5,
-      reasoning: "No news found",
+      confidence: 10,
+      reasoning: "APIs returned no data",
       sources: []
     };
   }
 
   const relevant = filterArticles(query, articles);
 
+  // fallback if filtering removes everything
+  const finalSources = relevant.length ? relevant : articles;
+
+  let verdict = "Likely Real";
+  let confidence = 70;
+
   if (!relevant.length) {
-    return {
-      verdict: "Unverified",
-      confidence: 15,
-      reasoning: "No strongly relevant news",
-      sources: []
-    };
+    verdict = "Unverified";
+    confidence = 30;
   }
-
-  const avg =
-    relevant.reduce((s, a) => s + a.score, 0) /
-    relevant.length;
-
-  let verdict = "Unverified";
-
-  if (avg >= 3) verdict = "Likely Real";
-  else if (avg <= 1.5) verdict = "Possibly Misleading";
 
   return {
     verdict,
-    confidence: Math.min(95, avg * 20),
-    reasoning: `${relevant.length} relevant sources found`,
-    sources: relevant.slice(0, 8)
+    confidence,
+    reasoning: `${finalSources.length} sources analyzed`,
+    sources: finalSources.slice(0, 8)
   };
 }
 
@@ -156,28 +137,47 @@ function analyze(query, articles) {
    ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
-  const { text } = req.body;
+  try {
+    const { text } = req.body;
 
-  if (!text) {
-    return res.json({
-      verdict: "Unverified",
+    if (!text) {
+      return res.json({
+        verdict: "Unverified",
+        confidence: 0,
+        reasoning: "No input",
+        sources: []
+      });
+    }
+
+    // fetch both
+    const [gnews, mediastack] = await Promise.all([
+      fetchGNews(text),
+      fetchMediastack(text)
+    ]);
+
+    const merged = mergeArticles(gnews, mediastack);
+
+    const result = analyze(text, merged);
+
+    res.json(result);
+
+  } catch (err) {
+    console.log(err);
+
+    res.json({
+      verdict: "Error",
       confidence: 0,
-      reasoning: "No input",
+      reasoning: "Server error",
       sources: []
     });
   }
-
-  const articles = await fetchNews(text);
-  const result = analyze(text, articles);
-
-  res.json(result);
 });
 
 /* -------------------------
    ROOT
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("BACKEND LIVE 🚀");
+  res.send("FINAL BACKEND WORKING 🚀");
 });
 
 app.listen(PORT, () => {
