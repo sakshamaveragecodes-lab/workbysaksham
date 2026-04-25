@@ -14,36 +14,34 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   CLEAN TEXT
-------------------------- */
-function clean(text) {
-  return text.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
-}
-
-/* -------------------------
-   IMPORTANT WORDS (REMOVE STOPWORDS)
+   CLEAN + KEYWORDS
 ------------------------- */
 const STOPWORDS = new Set([
-  "the","is","in","on","at","of","and","a","to","for","with","by","an"
+  "the","is","in","on","at","of","and","a","to","for","with","by","an",
+  "has","have","had","will","be","was","were"
 ]);
 
-function extractKeywords(text) {
+function clean(text) {
+  return text.toLowerCase().replace(/[^a-z0-9 ]/g, "");
+}
+
+function getKeywords(text) {
   return clean(text)
     .split(" ")
     .filter(w => w && !STOPWORDS.has(w));
 }
 
 /* -------------------------
-   SMART MATCH SCORE
+   STRICT MATCH LOGIC
 ------------------------- */
-function scoreMatch(queryWords, titleWords) {
+function matchScore(queryWords, titleWords) {
   let match = 0;
 
   queryWords.forEach(q => {
     if (titleWords.includes(q)) match++;
   });
 
-  return match / queryWords.length;
+  return match;
 }
 
 /* -------------------------
@@ -80,7 +78,7 @@ async function fetchNews(query) {
       })));
     }
 
-    // Remove duplicates
+    // REMOVE DUPLICATES
     const seen = new Set();
     return articles.filter(a => {
       const key = clean(a.title);
@@ -96,19 +94,20 @@ async function fetchNews(query) {
 }
 
 /* -------------------------
-   FILTER + RANK
+   FILTER + RANK (IMPORTANT FIX)
 ------------------------- */
-function filterAndRank(query, articles) {
-  const qWords = extractKeywords(query);
+function filterArticles(query, articles) {
+  const qWords = getKeywords(query);
 
   return articles
     .map(a => {
-      const tWords = extractKeywords(a.title);
-      const score = scoreMatch(qWords, tWords);
+      const tWords = getKeywords(a.title);
+      const score = matchScore(qWords, tWords);
 
       return { ...a, score };
     })
-    .filter(a => a.score >= 0.5) // STRICT
+    // STRICT: must match at least 2 important words
+    .filter(a => a.score >= Math.max(2, Math.ceil(qWords.length * 0.5)))
     .sort((a, b) => b.score - a.score);
 }
 
@@ -125,30 +124,31 @@ function analyze(query, articles) {
     };
   }
 
-  const ranked = filterAndRank(query, articles);
+  const relevant = filterArticles(query, articles);
 
-  if (!ranked.length) {
+  if (!relevant.length) {
     return {
       verdict: "Unverified",
-      confidence: 10,
-      reasoning: "No relevant articles",
+      confidence: 15,
+      reasoning: "No strongly relevant news articles",
       sources: []
     };
   }
 
-  const avg =
-    ranked.reduce((s, a) => s + a.score, 0) / ranked.length;
+  const avgScore =
+    relevant.reduce((sum, a) => sum + a.score, 0) /
+    relevant.length;
 
   let verdict = "Unverified";
 
-  if (avg > 0.75) verdict = "Likely Real";
-  else if (avg < 0.5) verdict = "Possibly Misleading";
+  if (avgScore >= 3) verdict = "Likely Real";
+  else if (avgScore <= 1.5) verdict = "Possibly Misleading";
 
   return {
     verdict,
-    confidence: Math.round(avg * 100),
-    reasoning: `${ranked.length} high-quality matches`,
-    sources: ranked.slice(0, 8)
+    confidence: Math.min(95, avgScore * 20),
+    reasoning: `${relevant.length} strongly matching articles`,
+    sources: relevant.slice(0, 8)
   };
 }
 
@@ -177,7 +177,7 @@ app.post("/analyze", async (req, res) => {
    ROOT
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("FREE PRODUCTION BACKEND RUNNING ✅");
+  res.send("FREE BACKEND RUNNING ✅");
 });
 
 app.listen(PORT, () => {
