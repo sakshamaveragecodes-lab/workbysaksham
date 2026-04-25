@@ -8,12 +8,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 
 /* -------------------------
-   CLEAN
-------------------------- */
-const clean = (t) => t.toLowerCase().replace(/[^a-z0-9 ]/g, "");
-
-/* -------------------------
-   FETCH RSS
+   FETCH NEWS (Google RSS)
 ------------------------- */
 async function fetchNews(query) {
   try {
@@ -42,12 +37,41 @@ async function fetchNews(query) {
 }
 
 /* -------------------------
-   SOURCE WEIGHT
+   HUGGINGFACE EMBEDDING
+------------------------- */
+async function getEmbedding(text) {
+  const res = await fetch(
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.HF_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ inputs: text })
+    }
+  );
+
+  return await res.json();
+}
+
+/* -------------------------
+   COSINE SIMILARITY
+------------------------- */
+function cosineSim(a, b) {
+  const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
+  const magA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
+  const magB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
+  return dot / (magA * magB);
+}
+
+/* -------------------------
+   SOURCE CREDIBILITY
 ------------------------- */
 function sourceScore(source) {
   const s = source.toLowerCase();
 
-  const high = ["reuters", "bbc", "associated press", "ap news", "al jazeera"];
+  const high = ["reuters", "bbc", "ap news", "associated press", "al jazeera"];
   const medium = ["the hindu", "indian express", "times of india", "hindustan times"];
 
   if (high.some(x => s.includes(x))) return 3;
@@ -56,96 +80,89 @@ function sourceScore(source) {
 }
 
 /* -------------------------
-   INTENT DETECTION
+   INTENT FILTER
 ------------------------- */
-function intentPenalty(title) {
+function penalty(title) {
   const t = title.toLowerCase();
 
-  const entertainment = ["movie","film","netflix","review","ranking"];
-  const opinion = ["opinion","editorial","analysis"];
-  const speculative = ["could","might","may","rumor","speculation","possible"];
+  const bad = ["movie","film","netflix","review","ranking","celebrity"];
+  const opinion = ["opinion","editorial"];
+  const rumor = ["rumor","might","could","speculation"];
 
-  let penalty = 0;
+  let p = 0;
 
-  if (entertainment.some(w => t.includes(w))) penalty += 4;
-  if (opinion.some(w => t.includes(w))) penalty += 2;
-  if (speculative.some(w => t.includes(w))) penalty += 1;
+  if (bad.some(w => t.includes(w))) p += 4;
+  if (opinion.some(w => t.includes(w))) p += 2;
+  if (rumor.some(w => t.includes(w))) p += 1;
 
-  return penalty;
+  return p;
 }
 
 /* -------------------------
-   ENTITY MATCH SCORE
+   SMART RANKING
 ------------------------- */
-function matchScore(query, title) {
-  const words = clean(query).split(" ").filter(w => w.length > 2);
-  const t = title.toLowerCase();
+async function rank(query, articles) {
 
-  let count = 0;
+  const queryVec = await getEmbedding(query);
 
-  words.forEach(w => {
-    if (t.includes(w)) count++;
-  });
+  const scored = [];
 
-  return count / words.length; // normalized
+  for (let a of articles) {
+    try {
+      const vec = await getEmbedding(a.title);
+
+      const sim = cosineSim(queryVec, vec);
+
+      const cred = sourceScore(a.source);
+      const pen = penalty(a.title);
+
+      const score = (sim * 10) + cred - pen;
+
+      if (sim > 0.45) {
+        scored.push({ ...a, score, sim, cred });
+      }
+
+    } catch {}
+  }
+
+  return scored.sort((a, b) => b.score - a.score);
 }
 
 /* -------------------------
-   FINAL SCORING ENGINE
+   FINAL ANALYSIS
 ------------------------- */
-function rankArticles(query, articles) {
-  return articles.map(a => {
+function analyze(scored) {
 
-    const match = matchScore(query, a.title);      // 0–1
-    const credibility = sourceScore(a.source);     // 1–3
-    const penalty = intentPenalty(a.title);        // 0–?
-
-    // 🔥 final score formula
-    const score = (match * 5) + credibility - penalty;
-
-    return { ...a, score, match, credibility };
-
-  })
-  .filter(a => a.match > 0.3) // must be relevant
-  .sort((a, b) => b.score - a.score);
-}
-
-/* -------------------------
-   ANALYSIS
-------------------------- */
-function analyze(query, articles) {
-
-  const ranked = rankArticles(query, articles);
-
-  if (!ranked.length) {
+  if (!scored.length) {
     return {
       verdict: "Possibly Misleading",
       confidence: 20,
-      reasoning: "No strong relevant news coverage",
-      sources: articles.slice(0, 5)
+      reasoning: "No relevant or credible coverage found",
+      sources: []
     };
   }
 
-  const top = ranked.slice(0, 8);
+  const top = scored.slice(0, 8);
 
   const avgScore = top.reduce((s, a) => s + a.score, 0) / top.length;
-  const avgCred = top.reduce((s, a) => s + a.credibility, 0) / top.length;
+  const avgCred = top.reduce((s, a) => s + a.cred, 0) / top.length;
 
-  // 🔥 DECISION LOGIC
-  if (avgScore > 5 && avgCred > 2) {
+  const consistency = top.length;
+
+  if (avgScore > 6 && avgCred > 2 && consistency >= 5) {
     return {
       verdict: "Likely Real",
-      confidence: Math.min(90, Math.round(avgScore * 15)),
-      reasoning: "Strong multi-source confirmation",
+      confidence: Math.min(95, Math.round(avgScore * 12)),
+      reasoning: "Strong agreement across multiple credible sources",
       sources: top
     };
   }
 
-  if (avgScore > 3) {
+  if (avgScore > 4) {
     return {
       verdict: "Unverified",
       confidence: 50,
-      reasoning: "Partial or inconsistent coverage",
+      reasoning: "Some relevant coverage but lacks strong confirmation",
       sources: top
     };
   }
@@ -153,7 +170,7 @@ function analyze(query, articles) {
   return {
     verdict: "Possibly Misleading",
     confidence: 30,
-    reasoning: "Weak relevance or low credibility signals",
+    reasoning: "Weak relevance or unreliable sources",
     sources: top
   };
 }
@@ -162,6 +179,7 @@ function analyze(query, articles) {
    ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
+
   const { text } = req.body;
 
   if (!text) {
@@ -174,10 +192,13 @@ app.post("/analyze", async (req, res) => {
   }
 
   const articles = await fetchNews(text);
-  const result = analyze(text, articles);
+
+  const ranked = await rank(text, articles);
+
+  const result = analyze(ranked);
 
   res.json(result);
 });
 
 /* ------------------------- */
-app.listen(PORT, () => console.log("Server running"));
+app.listen(PORT, () => console.log("🚀 Smart backend running"));
