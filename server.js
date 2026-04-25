@@ -11,17 +11,72 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const cache = new Map();
 
-/* ---------------- QUERY NORMALIZATION ---------------- */
-function normalizeQuery(q) {
-  return q
-    .toLowerCase()
-    .replace(/\busa\b/g, "us")
-    .replace(/\buk\b/g, "united kingdom")
-    .replace(/\s+/g, " ")
-    .trim();
+/* ---------------- LIGHTWEIGHT KNOWLEDGE GRAPH ---------------- */
+const knowledgeGraph = new Map();
+// format: entity -> { relation -> value }
+
+function updateKG(subject, relation, object, confidence) {
+  if (!knowledgeGraph.has(subject)) knowledgeGraph.set(subject, {});
+  const node = knowledgeGraph.get(subject);
+
+  if (!node[relation] || node[relation].confidence < confidence) {
+    node[relation] = { value: object, confidence };
+  }
 }
 
-/* ---------------- FETCH: GNEWS ---------------- */
+function checkKG(subject, relation, object) {
+  const node = knowledgeGraph.get(subject);
+  if (!node || !node[relation]) return null;
+
+  if (node[relation].value === object) return "support";
+  return "contradict";
+}
+
+/* ---------------- QUERY NORMALIZATION ---------------- */
+function normalizeQuery(q) {
+  return q.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/* ---------------- ENTITY EXTRACTION ---------------- */
+function extractEntities(text) {
+  return text.match(/[A-Z][a-z]+(?:\s[A-Z][a-z]+)+/g) || [];
+}
+
+/* ---------------- CLAIM PARSING ---------------- */
+function parseClaim(text) {
+  const lower = text.toLowerCase();
+
+  const entities = extractEntities(text);
+  if (entities.length < 2) return null;
+
+  if (lower.includes("wife")) {
+    return {
+      subject: entities[0],
+      relation: "spouse",
+      object: entities[1]
+    };
+  }
+
+  if (lower.includes("husband")) {
+    return {
+      subject: entities[0],
+      relation: "spouse",
+      object: entities[1]
+    };
+  }
+
+  if (lower.includes("is")) {
+    return {
+      subject: entities[0],
+      relation: "is",
+      object: entities[1]
+    };
+  }
+
+  return null;
+}
+
+/* ---------------- FETCH FUNCTIONS ---------------- */
 async function fetchGNews(query) {
   try {
     const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&lang=en&country=in&max=10&apikey=${process.env.GNEWS_API_KEY}`;
@@ -38,7 +93,6 @@ async function fetchGNews(query) {
   }
 }
 
-/* ---------------- FETCH: MEDIASTACK ---------------- */
 async function fetchMediastack(query) {
   try {
     const url = `http://api.mediastack.com/v1/news?access_key=${process.env.MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&languages=en&limit=10`;
@@ -55,7 +109,6 @@ async function fetchMediastack(query) {
   }
 }
 
-/* ---------------- FETCH: GOOGLE RSS ---------------- */
 async function fetchGoogle(query) {
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-IN&gl=IN&ceid=IN:en`;
@@ -84,46 +137,6 @@ function words(text) {
   return text.toLowerCase().split(/\W+/).filter(w => w.length > 2);
 }
 
-function relevanceScore(query, title) {
-  const q = words(query);
-  const t = words(title);
-
-  let score = 0;
-  q.forEach(w => {
-    if (t.includes(w)) score += 2;
-  });
-
-  return score / (t.length || 1);
-}
-
-/* ---------------- SOURCE SCORING ---------------- */
-function sourceScore(source) {
-  const s = source.toLowerCase();
-
-  if (["reuters","bbc","associated press"].some(x => s.includes(x)))
-    return 4;
-
-  if (["the hindu","indian express"].some(x => s.includes(x)))
-    return 3;
-
-  if (["ndtv","times of india"].some(x => s.includes(x)))
-    return 2;
-
-  return 1;
-}
-
-/* ---------------- PENALTY ---------------- */
-function penalty(title) {
-  const t = title.toLowerCase();
-  let p = 0;
-
-  if (["celebrity","movie","review"].some(w => t.includes(w))) p += 3;
-  if (["rumor","might","unverified"].some(w => t.includes(w))) p += 2;
-
-  return p;
-}
-
-/* ---------------- SIMILARITY ---------------- */
 function similarity(a, b) {
   const w1 = words(a);
   const w2 = words(b);
@@ -131,42 +144,38 @@ function similarity(a, b) {
   return common / Math.max(w1.length, 1);
 }
 
-/* ---------------- CLUSTER ---------------- */
-function cluster(articles) {
-  const clusters = [];
+/* ---------------- SOURCE SCORING ---------------- */
+function sourceScore(source) {
+  const s = source.toLowerCase();
 
-  for (let art of articles) {
-    let found = false;
+  if (["reuters","bbc","associated press"].some(x => s.includes(x))) return 4;
+  if (["the hindu","indian express"].some(x => s.includes(x))) return 3;
+  if (["ndtv","times of india"].some(x => s.includes(x))) return 2;
 
-    for (let c of clusters) {
-      if (similarity(c[0].title, art.title) > 0.5) {
-        c.push(art);
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) clusters.push([art]);
-  }
-
-  return clusters.sort((a, b) => b.length - a.length);
+  return 1;
 }
 
-/* ---------------- AGREEMENT (FIXED) ---------------- */
-function computeAgreement(cluster) {
-  if (cluster.length < 2) return 0;
+/* ---------------- EVIDENCE ANALYSIS ---------------- */
+function analyzeEvidence(claim, articles) {
+  let support = 0;
+  let contradict = 0;
 
-  let total = 0;
-  let count = 0;
+  for (let art of articles) {
+    const title = art.title.toLowerCase();
 
-  for (let i = 0; i < cluster.length; i++) {
-    for (let j = i + 1; j < cluster.length; j++) {
-      total += similarity(cluster[i].title, cluster[j].title);
-      count++;
+    const hasSubject = title.includes(claim.subject.toLowerCase());
+    const hasObject = title.includes(claim.object.toLowerCase());
+
+    if (hasSubject && hasObject) {
+      if (title.includes("wife") || title.includes("husband") || title.includes("married")) {
+        support++;
+      } else {
+        contradict++;
+      }
     }
   }
 
-  return total / count;
+  return { support, contradict };
 }
 
 /* ---------------- ANALYSIS ---------------- */
@@ -181,16 +190,16 @@ function analyze(query, articles) {
     };
   }
 
-  const ranked = articles.map(a => {
-    const relevance = relevanceScore(query, a.title);
-    const cred = sourceScore(a.source);
-    const pen = penalty(a.title);
+  const claim = parseClaim(query);
 
-    const score = (relevance * 10) + cred - pen;
+  const ranked = articles.map(a => {
+    const relevance = similarity(query, a.title);
+    const cred = sourceScore(a.source);
+    const score = (relevance * 10) + cred;
 
     return { ...a, score, relevance, cred };
   })
-  .filter(a => a.relevance > 0.08)
+  .filter(a => a.relevance > 0.1)
   .sort((a, b) => b.score - a.score);
 
   if (!ranked.length) {
@@ -202,47 +211,55 @@ function analyze(query, articles) {
     };
   }
 
-  const clusters = cluster(ranked);
-  const main = clusters[0];
+  const top = ranked.slice(0, 10);
 
-  const coverage = main.length;
-  const avgCred = main.reduce((s, a) => s + a.cred, 0) / coverage;
-  const agreement = computeAgreement(main);
+  /* -------- CLAIM VALIDATION -------- */
+  if (claim) {
+    const kgCheck = checkKG(claim.subject, claim.relation, claim.object);
 
-  /* -------- FINAL DECISION -------- */
+    const { support, contradict } = analyzeEvidence(claim, top);
 
-  if (coverage >= 5 && avgCred >= 2.5 && agreement > 0.5) {
-    return {
-      verdict: "Verified ✅",
-      confidence: Math.min(95, Math.round((coverage * 10) + (agreement * 50))),
-      reasoning: "Multiple trusted sources report the same story",
-      sources: main.slice(0, 8)
-    };
+    const confidence = Math.min(95, (support * 15));
+
+    if (kgCheck === "contradict" || contradict > support) {
+      return {
+        verdict: "Misleading ❌",
+        confidence: 80,
+        reasoning: "Evidence contradicts the claim",
+        sources: top.slice(0, 6)
+      };
+    }
+
+    if (support >= 3) {
+      updateKG(claim.subject, claim.relation, claim.object, confidence);
+
+      return {
+        verdict: "Verified ✅",
+        confidence,
+        reasoning: "Claim supported by multiple sources",
+        sources: top.slice(0, 6)
+      };
+    }
   }
 
-  if (agreement < 0.25) {
-    return {
-      verdict: "Conflicting ⚠️",
-      confidence: 45,
-      reasoning: "Different narratives across sources",
-      sources: main.slice(0, 6)
-    };
-  }
+  /* -------- DEFAULT LOGIC -------- */
+  const coverage = top.length;
+  const avgCred = top.reduce((s, a) => s + a.cred, 0) / coverage;
 
-  if (coverage < 3) {
+  if (coverage >= 5 && avgCred >= 2.5) {
     return {
-      verdict: "Unverified ❓",
-      confidence: 30,
-      reasoning: "Not enough coverage",
-      sources: main.slice(0, 5)
+      verdict: "Likely Real 👍",
+      confidence: 85,
+      reasoning: "Consistent coverage across sources",
+      sources: top.slice(0, 6)
     };
   }
 
   return {
-    verdict: "Likely Real 👍",
-    confidence: Math.min(90, Math.round((coverage * 8) + (avgCred * 10))),
-    reasoning: "Consistent reporting across sources",
-    sources: main.slice(0, 6)
+    verdict: "Unverified ❓",
+    confidence: 40,
+    reasoning: "Insufficient reliable agreement",
+    sources: top.slice(0, 6)
   };
 }
 
@@ -260,9 +277,7 @@ app.post("/analyze", async (req, res) => {
       });
     }
 
-    if (cache.has(text)) {
-      return res.json(cache.get(text));
-    }
+    if (cache.has(text)) return res.json(cache.get(text));
 
     const query = normalizeQuery(text);
 
@@ -279,7 +294,7 @@ app.post("/analyze", async (req, res) => {
     cache.set(text, result);
     res.json(result);
 
-  } catch (err) {
+  } catch {
     res.json({
       verdict: "Unverified ❓",
       confidence: 10,
@@ -290,5 +305,5 @@ app.post("/analyze", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("🚀 Veritas AI ELITE (Fully Fixed) running");
+  console.log("🚀 Veritas AI upgraded with KG + claim validation");
 });
