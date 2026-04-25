@@ -1,8 +1,5 @@
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -18,9 +15,9 @@ function clean(text) {
 }
 
 /* -------------------------
-   RSS FETCH (NO API KEY)
+   FETCH GOOGLE NEWS RSS
 ------------------------- */
-async function fetchRSS(query) {
+async function fetchNews(query) {
   try {
     const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-IN&gl=IN&ceid=IN:en`;
 
@@ -29,115 +26,136 @@ async function fetchRSS(query) {
 
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
 
-    return items.slice(0, 10).map(item => {
+    return items.slice(0, 12).map(item => {
       const block = item[1];
 
-      const title = (block.match(/<title>(.*?)<\/title>/)?.[1] || "").replace(/<!\[CDATA\[|\]\]>/g, "");
+      const title = (block.match(/<title>(.*?)<\/title>/)?.[1] || "")
+        .replace(/<!\[CDATA\[|\]\]>/g, "");
+
       const link = (block.match(/<link>(.*?)<\/link>/)?.[1] || "");
 
-      return {
-        title,
-        url: link,
-        source: "Google News"
-      };
+      const source = title.split(" - ").pop();
+
+      return { title, url: link, source };
     });
 
   } catch (err) {
-    console.log("RSS error:", err.message);
+    console.log(err);
     return [];
   }
 }
 
 /* -------------------------
-   OPTIONAL GNEWS (if key works)
-------------------------- */
-async function fetchGNews(query) {
-  if (!process.env.GNEWS_API_KEY) return [];
-
-  try {
-    const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${process.env.GNEWS_API_KEY}`;
-
-    const res = await fetch(url);
-    const data = await res.json();
-
-    if (!data.articles) return [];
-
-    return data.articles.map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source?.name || "GNews"
-    }));
-
-  } catch {
-    return [];
-  }
-}
-
-/* -------------------------
-   MERGE + REMOVE DUPLICATES
-------------------------- */
-function merge(a, b) {
-  const seen = new Set();
-
-  return [...a, ...b].filter(x => {
-    const key = clean(x.title);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-/* -------------------------
-   FILTER
+   FILTER + SCORE
 ------------------------- */
 function filterArticles(query, articles) {
   const words = clean(query).split(" ");
 
+  const blacklist = [
+    "movie","movies","film","review","ranking",
+    "netflix","trailer","series","celebrity"
+  ];
+
+  const weakWords = [
+    "could","might","may","rumor","speculation",
+    "believe","possible","unconfirmed"
+  ];
+
   return articles
     .map(a => {
+      const title = a.title.toLowerCase();
+
       let score = 0;
+
+      // keyword match
       words.forEach(w => {
-        if (a.title.toLowerCase().includes(w)) score++;
+        if (title.includes(w)) score++;
       });
+
+      // remove junk
+      if (blacklist.some(w => title.includes(w))) score -= 3;
+
+      // penalize weak claims
+      if (weakWords.some(w => title.includes(w))) score -= 1;
+
       return { ...a, score };
     })
+    .filter(a => a.score > 0)
     .sort((a, b) => b.score - a.score);
 }
 
 /* -------------------------
-   ANALYSIS
+   ANALYSIS ENGINE
 ------------------------- */
 function analyze(query, articles) {
 
-  const fallback = [
-    {
-      title: "Ongoing discussions reported regarding the topic",
-      url: "#",
-      source: "Fallback"
-    },
-    {
-      title: "Multiple reports indicate developments related to the query",
-      url: "#",
-      source: "Fallback"
-    }
+  const relevant = filterArticles(query, articles);
+
+  // credible sources list
+  const credible = [
+    "reuters","bbc","associated press","ap news",
+    "the hindu","indian express","al jazeera",
+    "times of india","hindustan times"
   ];
 
-  if (!articles.length) {
+  if (!relevant.length) {
     return {
-      verdict: "Unverified",
-      confidence: 30,
-      reasoning: "Limited live data, using fallback",
-      sources: fallback
+      verdict: "Possibly Misleading",
+      confidence: 20,
+      reasoning: "No credible or relevant news coverage found",
+      sources: articles.slice(0, 5)
     };
   }
 
-  const ranked = filterArticles(query, articles);
+  let credibilityScore = 0;
+
+  relevant.forEach(a => {
+    const src = a.source.toLowerCase();
+    if (credible.some(c => src.includes(c))) {
+      credibilityScore++;
+    }
+  });
+
+  const ratio = credibilityScore / relevant.length;
+
+  // speculative topic detection
+  const speculativeWords = [
+    "alien","ufo","ghost","time travel",
+    "conspiracy","end of world"
+  ];
+
+  if (speculativeWords.some(w => query.toLowerCase().includes(w))) {
+    return {
+      verdict: "Unverified",
+      confidence: 25,
+      reasoning: "Topic is speculative with no confirmed evidence",
+      sources: relevant.slice(0, 5)
+    };
+  }
+
+  if (ratio < 0.3) {
+    return {
+      verdict: "Possibly Misleading",
+      confidence: 30,
+      reasoning: "Low credibility sources or weak evidence",
+      sources: relevant.slice(0, 5)
+    };
+  }
+
+  if (ratio < 0.6) {
+    return {
+      verdict: "Unverified",
+      confidence: 50,
+      reasoning: "Limited confirmation across reliable sources",
+      sources: relevant.slice(0, 6)
+    };
+  }
 
   return {
     verdict: "Likely Real",
-    confidence: 75,
-    reasoning: `${ranked.length} sources analyzed`,
-    sources: ranked.slice(0, 8)
+    confidence: 80,
+    reasoning: "Multiple credible sources confirm the claim",
+    sources: relevant.slice(0, 8)
   };
 }
 
@@ -145,48 +163,28 @@ function analyze(query, articles) {
    ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
-  try {
-    const { text } = req.body;
+  const { text } = req.body;
 
-    if (!text) {
-      return res.json({
-        verdict: "Unverified",
-        confidence: 0,
-        reasoning: "No input",
-        sources: []
-      });
-    }
-
-    const [rss, gnews] = await Promise.all([
-      fetchRSS(text),
-      fetchGNews(text)
-    ]);
-
-    console.log("RSS:", rss.length, "GNEWS:", gnews.length);
-
-    const merged = merge(rss, gnews);
-
-    const result = analyze(text, merged);
-
-    res.json(result);
-
-  } catch (err) {
-    console.log(err);
-
-    res.json({
-      verdict: "Error",
+  if (!text) {
+    return res.json({
+      verdict: "Unverified",
       confidence: 0,
-      reasoning: "Server error",
+      reasoning: "No input provided",
       sources: []
     });
   }
+
+  const articles = await fetchNews(text);
+  const result = analyze(text, articles);
+
+  res.json(result);
 });
 
 /* -------------------------
    ROOT
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("FINAL BACKEND LIVE 🚀");
+  res.send("VERITAS AI BACKEND RUNNING 🚀");
 });
 
 app.listen(PORT, () => {
