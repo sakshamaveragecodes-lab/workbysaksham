@@ -14,9 +14,6 @@ const PORT = process.env.PORT || 10000;
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
-/* -------------------------
-   NLP SETUP
-------------------------- */
 const TfIdf = natural.TfIdf;
 const tokenizer = new natural.WordTokenizer();
 
@@ -55,8 +52,8 @@ async function fetchNews(query) {
   if (cached) return cached;
 
   try {
-    const gnewsURL = `https://gnews.io/api/v4/search?q=${query}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
-    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=10`;
+    const gnewsURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
+    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&limit=10`;
 
     const [gRes, mRes] = await Promise.allSettled([
       fetch(gnewsURL),
@@ -102,7 +99,7 @@ async function fetchNews(query) {
     return unique;
 
   } catch (err) {
-    console.error(err);
+    console.error("Fetch error:", err);
     return [];
   }
 }
@@ -129,30 +126,19 @@ async function getArticlesSmart(input) {
 }
 
 /* -------------------------
-   SEMANTIC SCORING
+   STRICT RELEVANCE FILTER
 ------------------------- */
-function computeSimilarity(query, articles) {
-  const tfidf = new TfIdf();
+function isRelevant(query, title) {
+  const qWords = clean(query).split(" ");
+  const tWords = clean(title).split(" ");
 
-  tfidf.addDocument(query);
+  let match = 0;
 
-  articles.forEach(a => {
-    tfidf.addDocument(clean(a.title));
+  qWords.forEach(word => {
+    if (tWords.includes(word)) match++;
   });
 
-  let scores = [];
-
-  articles.forEach((a, i) => {
-    let score = 0;
-
-    tokenizer.tokenize(query).forEach(word => {
-      score += tfidf.tfidf(word, i + 1);
-    });
-
-    scores.push(score * a.weight);
-  });
-
-  return scores;
+  return match / qWords.length >= 0.4;
 }
 
 /* -------------------------
@@ -170,26 +156,54 @@ function credibilityScore(source) {
 }
 
 /* -------------------------
-   FINAL ANALYSIS
+   ANALYSIS
 ------------------------- */
 function analyze(input, articles) {
   if (!articles.length) {
     return {
       verdict: "Unverified",
       confidence: 5,
-      reasoning: "No credible coverage found",
-      bias: "Unknown"
+      reasoning: "No news coverage found",
+      sources: []
     };
   }
 
-  const scores = computeSimilarity(input, articles);
+  const relevant = articles.filter(a =>
+    isRelevant(input, a.title)
+  );
 
-  let weighted = scores.map((s, i) => {
-    return s * credibilityScore(articles[i].source);
+  if (!relevant.length) {
+    return {
+      verdict: "Unverified",
+      confidence: 10,
+      reasoning: "No relevant news found",
+      sources: []
+    };
+  }
+
+  const tfidf = new TfIdf();
+  tfidf.addDocument(clean(input));
+
+  relevant.forEach(a => {
+    tfidf.addDocument(clean(a.title));
+  });
+
+  let scores = [];
+
+  relevant.forEach((a, i) => {
+    let score = 0;
+
+    tokenizer.tokenize(clean(input)).forEach(word => {
+      score += tfidf.tfidf(word, i + 1);
+    });
+
+    score *= credibilityScore(a.source);
+
+    scores.push(score);
   });
 
   const avg =
-    weighted.reduce((a, b) => a + b, 0) / weighted.length;
+    scores.reduce((a, b) => a + b, 0) / scores.length;
 
   let verdict = "Unverified";
 
@@ -199,8 +213,8 @@ function analyze(input, articles) {
   return {
     verdict,
     confidence: Math.min(95, Math.round(avg * 25)),
-    reasoning: `${articles.length} sources analyzed with semantic matching`,
-    bias: "Low"
+    reasoning: `${relevant.length} relevant sources after filtering`,
+    sources: relevant.slice(0, 8)
   };
 }
 
@@ -223,10 +237,7 @@ app.post("/analyze", async (req, res) => {
     const articles = await getArticlesSmart(text);
     const result = analyze(text, articles);
 
-    res.json({
-      ...result,
-      sources: articles.slice(0, 8)
-    });
+    res.json(result);
 
   } catch (err) {
     console.error(err);
@@ -239,8 +250,11 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
+/* -------------------------
+   ROOT
+------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 PRODUCTION BACKEND RUNNING");
+  res.send("🚀 FINAL PRODUCTION BACKEND RUNNING");
 });
 
 app.listen(PORT, () => {
