@@ -25,20 +25,20 @@ function clean(text) {
   return text.toLowerCase().replace(/[^a-z0-9 ]/g, "");
 }
 
-function getKeywords(text) {
+function keywords(text) {
   return clean(text)
     .split(" ")
     .filter(w => w && !STOPWORDS.has(w));
 }
 
 /* -------------------------
-   STRICT MATCH LOGIC
+   MATCH SCORE (STRICT)
 ------------------------- */
-function matchScore(queryWords, titleWords) {
+function score(queryWords, titleWords) {
   let match = 0;
 
-  queryWords.forEach(q => {
-    if (titleWords.includes(q)) match++;
+  queryWords.forEach(w => {
+    if (titleWords.includes(w)) match++;
   });
 
   return match;
@@ -78,7 +78,7 @@ async function fetchNews(query) {
       })));
     }
 
-    // REMOVE DUPLICATES
+    // remove duplicates
     const seen = new Set();
     return articles.filter(a => {
       const key = clean(a.title);
@@ -94,19 +94,19 @@ async function fetchNews(query) {
 }
 
 /* -------------------------
-   FILTER + RANK (IMPORTANT FIX)
+   FILTER + RANK
 ------------------------- */
 function filterArticles(query, articles) {
-  const qWords = getKeywords(query);
+  const qWords = keywords(query);
 
   return articles
     .map(a => {
-      const tWords = getKeywords(a.title);
-      const score = matchScore(qWords, tWords);
+      const tWords = keywords(a.title);
+      const s = score(qWords, tWords);
 
-      return { ...a, score };
+      return { ...a, score: s };
     })
-    // STRICT: must match at least 2 important words
+    // MUST match at least 2 important words
     .filter(a => a.score >= Math.max(2, Math.ceil(qWords.length * 0.5)))
     .sort((a, b) => b.score - a.score);
 }
@@ -130,24 +130,24 @@ function analyze(query, articles) {
     return {
       verdict: "Unverified",
       confidence: 15,
-      reasoning: "No strongly relevant news articles",
+      reasoning: "No strongly relevant news",
       sources: []
     };
   }
 
-  const avgScore =
-    relevant.reduce((sum, a) => sum + a.score, 0) /
+  const avg =
+    relevant.reduce((s, a) => s + a.score, 0) /
     relevant.length;
 
   let verdict = "Unverified";
 
-  if (avgScore >= 3) verdict = "Likely Real";
-  else if (avgScore <= 1.5) verdict = "Possibly Misleading";
+  if (avg >= 3) verdict = "Likely Real";
+  else if (avg <= 1.5) verdict = "Possibly Misleading";
 
   return {
     verdict,
-    confidence: Math.min(95, avgScore * 20),
-    reasoning: `${relevant.length} strongly matching articles`,
+    confidence: Math.min(95, avg * 20),
+    reasoning: `${relevant.length} relevant sources found`,
     sources: relevant.slice(0, 8)
   };
 }
@@ -177,7 +177,7 @@ app.post("/analyze", async (req, res) => {
    ROOT
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("FREE BACKEND RUNNING ✅");
+  res.send("BACKEND LIVE 🚀");
 });
 
 app.listen(PORT, () => {
