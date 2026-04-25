@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { pipeline } from "@xenova/transformers";
 
 dotenv.config();
 
@@ -15,68 +14,66 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   LOAD MODEL ONCE (IMPORTANT)
-------------------------- */
-let embedder;
-
-async function initModel() {
-  embedder = await pipeline(
-    "feature-extraction",
-    "Xenova/all-MiniLM-L6-v2"
-  );
-  console.log("✅ AI Model Ready");
-}
-await initModel();
-
-/* -------------------------
    CLEAN QUERY
 ------------------------- */
 function cleanQuery(text) {
   return text
-    .replace(/[^a-zA-Z0-9 ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, "")
     .split(" ")
-    .slice(0, 12)
+    .slice(0, 10)
     .join(" ");
 }
 
 /* -------------------------
-   FETCH NEWS (PARALLEL)
+   FETCH NEWS (SAFE)
 ------------------------- */
 async function fetchNews(query) {
   try {
     const gnewsURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
     const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&languages=en&limit=10`;
 
-    const [gRes, mRes] = await Promise.all([
+    const [gRes, mRes] = await Promise.allSettled([
       fetch(gnewsURL),
       fetch(mediaURL)
     ]);
 
-    const gData = await gRes.json();
-    const mData = await mRes.json();
+    let articles = [];
 
-    const gnews = (gData.articles || []).map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source?.name || "Unknown"
-    }));
+    // GNews
+    if (gRes.status === "fulfilled") {
+      const gData = await gRes.value.json();
+      articles.push(
+        ...(gData.articles || []).map(a => ({
+          title: a.title,
+          url: a.url,
+          source: a.source?.name || "Unknown"
+        }))
+      );
+    }
 
-    const mediastack = (mData.data || []).map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source || "Unknown"
-    }));
+    // Mediastack
+    if (mRes.status === "fulfilled") {
+      const mData = await mRes.value.json();
+      articles.push(
+        ...(mData.data || []).map(a => ({
+          title: a.title,
+          url: a.url,
+          source: a.source || "Unknown"
+        }))
+      );
+    }
 
-    // MERGE + REMOVE DUPLICATES
+    // REMOVE DUPLICATES
     const seen = new Set();
-    const merged = [...gnews, ...mediastack].filter(a => {
+    const unique = articles.filter(a => {
       const key = a.title.toLowerCase();
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
 
-    return merged.slice(0, 12);
+    return unique.slice(0, 10);
 
   } catch (err) {
     console.error("Fetch error:", err);
@@ -85,80 +82,77 @@ async function fetchNews(query) {
 }
 
 /* -------------------------
-   COSINE SIMILARITY
+   SIMPLE BUT EFFECTIVE SCORING
 ------------------------- */
-function cosine(a, b) {
-  let dot = 0, magA = 0, magB = 0;
+function similarity(a, b) {
+  const wordsA = a.split(" ");
+  const wordsB = b.split(" ");
 
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    magA += a[i] * a[i];
-    magB += b[i] * b[i];
+  let match = 0;
+
+  for (let w of wordsA) {
+    if (wordsB.includes(w)) match++;
   }
 
-  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+  return match / Math.max(wordsA.length, 1);
 }
 
 /* -------------------------
-   SOURCE CREDIBILITY
+   SOURCE TRUST
 ------------------------- */
-function sourceWeight(source = "") {
+function sourceScore(source = "") {
   const s = source.toLowerCase();
 
-  if (s.includes("reuters")) return 1.0;
+  if (s.includes("reuters")) return 1;
   if (s.includes("bbc")) return 0.95;
-  if (s.includes("associated press") || s.includes("ap")) return 0.95;
+  if (s.includes("ap")) return 0.95;
   if (s.includes("the hindu")) return 0.9;
   if (s.includes("indian express")) return 0.9;
   if (s.includes("ndtv")) return 0.85;
-  if (s.includes("al jazeera")) return 0.9;
 
   return 0.6;
 }
 
 /* -------------------------
-   CORE ANALYSIS ENGINE
+   ANALYSIS (FAST + STABLE)
 ------------------------- */
-async function analyze(input, articles) {
+function analyze(input, articles) {
   if (!articles.length) {
     return {
       verdict: "Unverified",
       confidence: 10,
-      reasoning: "No news coverage found"
+      reasoning: "No coverage found"
     };
   }
 
-  const inputVec = (await embedder(input))[0];
+  const query = cleanQuery(input);
 
-  let weightedScores = [];
+  let scores = [];
 
   for (let a of articles) {
-    const vec = (await embedder(a.title))[0];
+    const sim = similarity(query, cleanQuery(a.title));
+    const trust = sourceScore(a.source);
 
-    const similarity = cosine(inputVec, vec);
-    const weight = sourceWeight(a.source);
-
-    weightedScores.push(similarity * weight);
+    scores.push(sim * trust);
   }
 
   const avg =
-    weightedScores.reduce((a, b) => a + b, 0) /
-    weightedScores.length;
+    scores.reduce((a, b) => a + b, 0) / scores.length;
 
-  const strongMatches =
-    weightedScores.filter(s => s > 0.7).length;
+  const strong =
+    scores.filter(s => s > 0.5).length;
 
   let verdict = "Unverified";
 
-  if (avg > 0.75 && strongMatches >= 3)
+  if (avg > 0.6 && strong >= 3)
     verdict = "Likely Real";
-  else if (avg < 0.4)
+  else if (avg < 0.3)
     verdict = "Possibly Misleading";
 
   return {
     verdict,
     confidence: Math.round(avg * 100),
-    reasoning: `Consensus: ${strongMatches} strong matches across sources`
+    reasoning: `Matched ${strong} sources with decent similarity`
   };
 }
 
@@ -166,7 +160,7 @@ async function analyze(input, articles) {
    ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Best Version Backend Running");
+  res.send("✅ Backend Working Perfectly");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -184,8 +178,7 @@ app.post("/analyze", async (req, res) => {
 
     const query = cleanQuery(text);
     const articles = await fetchNews(query);
-
-    const result = await analyze(text, articles);
+    const result = analyze(text, articles);
 
     res.json({
       ...result,
@@ -198,13 +191,13 @@ app.post("/analyze", async (req, res) => {
     res.json({
       verdict: "Error",
       confidence: 0,
-      reasoning: "Server failure",
+      reasoning: "Server crashed",
       sources: []
     });
   }
 });
 
 /* ------------------------- */
-app.listen(PORT, () =>
-  console.log(`🔥 Running on ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Running on port ${PORT}`);
+});
