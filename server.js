@@ -14,7 +14,7 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🔑 UTIL
+   🔑 KEYWORDS
 ------------------------- */
 function extractKeywords(text) {
   return text
@@ -26,61 +26,103 @@ function extractKeywords(text) {
 }
 
 /* -------------------------
-   🌐 FETCH NEWS
+   🌐 FETCH NEWS (BETTER COVERAGE)
 ------------------------- */
 async function fetchNews(text) {
-  try {
-    const keywords = extractKeywords(text);
-    const query = keywords.join(" ");
+  const keywords = extractKeywords(text);
 
+  const queries = [
+    keywords.join(" "),
+    keywords.slice(0, 3).join(" "),
+    text.slice(0, 50)
+  ];
+
+  let results = [];
+
+  for (let q of queries) {
     const [gnews, mediastack] = await Promise.all([
-      fetch(`https://gnews.io/api/v4/search?q=${query}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
+      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
         .then(r => r.json())
         .then(d => d.articles || [])
         .catch(() => []),
 
-      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=5`)
+      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5`)
         .then(r => r.json())
         .then(d => d.data || [])
         .catch(() => [])
     ]);
 
-    const combined = [
+    results.push(
       ...gnews.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source?.name || "Unknown"
+        source: a.source?.name || "Unknown",
+        date: new Date(a.publishedAt)
       })),
       ...mediastack.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source
+        source: a.source,
+        date: new Date(a.published_at)
       }))
-    ];
-
-    // dedupe
-    const seen = new Set();
-    return combined.filter(a => {
-      const key = a.title?.toLowerCase().slice(0, 80);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-  } catch {
-    return [];
+    );
   }
+
+  // remove duplicates
+  const seen = new Set();
+  return results.filter(a => {
+    const key = a.title?.toLowerCase().slice(0, 80);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /* -------------------------
-   🧠 AI FACT CHECK
+   🏢 SOURCE CREDIBILITY
+------------------------- */
+function sourceScore(source = "") {
+  const s = source.toLowerCase();
+
+  if (["bbc","reuters","ap","the hindu","indian express"].some(k => s.includes(k))) return 1;
+  if (["times","ndtv","cnn"].some(k => s.includes(k))) return 0.7;
+
+  return 0.4;
+}
+
+/* -------------------------
+   📊 BASIC SCORING
+------------------------- */
+function scoreArticles(input, articles) {
+  const keywords = extractKeywords(input);
+
+  return articles.map(a => {
+    const text = (a.title + " " + (a.desc || "")).toLowerCase();
+
+    const keywordMatch = keywords.filter(k => text.includes(k)).length;
+
+    const credibility = sourceScore(a.source);
+
+    const hours = (Date.now() - a.date) / (1000 * 60 * 60);
+    const recency = hours < 24 ? 1 : hours < 72 ? 0.7 : 0.4;
+
+    const score = keywordMatch * 0.3 + credibility * 0.5 + recency * 0.2;
+
+    return { ...a, score };
+  }).sort((a, b) => b.score - a.score);
+}
+
+/* -------------------------
+   🧠 AI REASONING (SAFE)
 ------------------------- */
 async function aiCheck(text, articles) {
 
+  if (!HF_API_KEY) return null;
+
   const context = articles
-    .slice(0, 5)
+    .slice(0, 4)
     .map((a, i) => `${i + 1}. ${a.title}`)
     .join("\n");
 
@@ -100,9 +142,6 @@ Return JSON:
 }
 `;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
   try {
     const res = await fetch(
       "https://api-inference.huggingface.co/models/google/flan-t5-large",
@@ -114,16 +153,13 @@ Return JSON:
         },
         body: JSON.stringify({
           inputs: prompt,
-          parameters: { max_new_tokens: 150 }
-        }),
-        signal: controller.signal
+          parameters: { max_new_tokens: 120 }
+        })
       }
     );
 
-    clearTimeout(timeout);
-
     const data = await res.json();
-    const output = data[0]?.generated_text || "";
+    const output = data[0]?.generated_text;
 
     return JSON.parse(output);
 
@@ -135,9 +171,9 @@ Return JSON:
 /* -------------------------
    🔁 FALLBACK LOGIC
 ------------------------- */
-function fallbackCheck(articles) {
+function fallback(scored) {
 
-  if (articles.length === 0) {
+  if (scored.length === 0) {
     return {
       verdict: "Unverified",
       confidence: 20,
@@ -145,18 +181,16 @@ function fallbackCheck(articles) {
     };
   }
 
-  const trustedList = ["bbc","reuters","ap","the hindu","indian express"];
+  const avgScore = scored.slice(0, 3).reduce((s, a) => s + a.score, 0) / 3;
 
-  const trusted = articles.some(a =>
-    trustedList.some(s => a.source?.toLowerCase().includes(s))
-  );
+  let verdict = "Unverified";
+  if (avgScore > 0.8) verdict = "Likely Real";
+  else if (avgScore < 0.4) verdict = "Possibly Fake";
 
   return {
-    verdict: trusted ? "Likely Real" : "Unverified",
-    confidence: trusted ? 65 : 40,
-    reasoning: trusted
-      ? "Covered by trusted sources"
-      : "Limited coverage"
+    verdict,
+    confidence: Math.round(avgScore * 100),
+    reasoning: "Based on source credibility and relevance"
   };
 }
 
@@ -167,20 +201,21 @@ async function analyze(text) {
 
   const articles = await fetchNews(text);
 
-  // Try AI first
-  const aiResult = await aiCheck(text, articles);
+  const scored = scoreArticles(text, articles);
+
+  const aiResult = await aiCheck(text, scored);
 
   let finalResult;
 
   if (aiResult && aiResult.verdict) {
     finalResult = aiResult;
   } else {
-    finalResult = fallbackCheck(articles);
+    finalResult = fallback(scored);
   }
 
   return {
     ...finalResult,
-    sources: articles.slice(0, 5)
+    sources: scored.slice(0, 5)
   };
 }
 
@@ -188,7 +223,7 @@ async function analyze(text) {
    🚀 ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Fact Checker Running");
+  res.send("🚀 Hybrid V4 Running");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -209,8 +244,6 @@ app.post("/analyze", async (req, res) => {
     res.json(result);
 
   } catch (err) {
-    console.error(err);
-
     res.json({
       verdict: "Unverified",
       confidence: 30,
