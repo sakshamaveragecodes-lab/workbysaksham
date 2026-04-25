@@ -31,42 +31,58 @@ async function fetchNews(query) {
       return { title, url: link, source };
     });
 
-  } catch {
+  } catch (err) {
+    console.error("❌ fetchNews error:", err);
     return [];
   }
 }
 
 /* -------------------------
-   HUGGINGFACE EMBEDDING
+   SAFE EMBEDDING
 ------------------------- */
 async function getEmbedding(text) {
-  const res = await fetch(
-    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.HF_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ inputs: text })
-    }
-  );
+  try {
+    if (!process.env.HF_API_KEY) throw new Error("No API key");
 
-  return await res.json();
+    const res = await fetch(
+      "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${process.env.HF_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ inputs: text })
+      }
+    );
+
+    const data = await res.json();
+
+    if (!Array.isArray(data)) throw new Error("Invalid embedding");
+
+    return data;
+
+  } catch (err) {
+    return null; // 🔥 fallback trigger
+  }
 }
 
 /* -------------------------
    COSINE SIMILARITY
 ------------------------- */
 function cosineSim(a, b) {
-  const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
-  const magA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
-  const magB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-  return dot / (magA * magB);
+  try {
+    const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
+    const magA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
+    const magB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
+    return dot / (magA * magB);
+  } catch {
+    return 0;
+  }
 }
 
 /* -------------------------
-   SOURCE CREDIBILITY
+   SOURCE SCORE
 ------------------------- */
 function sourceScore(source) {
   const s = source.toLowerCase();
@@ -80,7 +96,7 @@ function sourceScore(source) {
 }
 
 /* -------------------------
-   INTENT FILTER
+   FILTER BAD CONTENT
 ------------------------- */
 function penalty(title) {
   const t = title.toLowerCase();
@@ -99,7 +115,22 @@ function penalty(title) {
 }
 
 /* -------------------------
-   SMART RANKING
+   KEYWORD MATCH (FALLBACK)
+------------------------- */
+function keywordScore(query, title) {
+  const q = query.toLowerCase().split(" ");
+  const t = title.toLowerCase();
+
+  let count = 0;
+  q.forEach(w => {
+    if (t.includes(w)) count++;
+  });
+
+  return count / q.length;
+}
+
+/* -------------------------
+   SMART RANKING (AI + FALLBACK)
 ------------------------- */
 async function rank(query, articles) {
 
@@ -108,28 +139,34 @@ async function rank(query, articles) {
   const scored = [];
 
   for (let a of articles) {
-    try {
+
+    let sim = 0;
+
+    if (queryVec) {
       const vec = await getEmbedding(a.title);
+      if (vec) sim = cosineSim(queryVec, vec);
+    }
 
-      const sim = cosineSim(queryVec, vec);
+    // 🔥 fallback if AI fails
+    if (!sim || sim === 0) {
+      sim = keywordScore(query, a.title);
+    }
 
-      const cred = sourceScore(a.source);
-      const pen = penalty(a.title);
+    const cred = sourceScore(a.source);
+    const pen = penalty(a.title);
 
-      const score = (sim * 10) + cred - pen;
+    const score = (sim * 10) + cred - pen;
 
-      if (sim > 0.45) {
-        scored.push({ ...a, score, sim, cred });
-      }
-
-    } catch {}
+    if (sim > 0.2) {
+      scored.push({ ...a, score, cred });
+    }
   }
 
   return scored.sort((a, b) => b.score - a.score);
 }
 
 /* -------------------------
-   FINAL ANALYSIS
+   FINAL DECISION
 ------------------------- */
 function analyze(scored) {
 
@@ -137,7 +174,7 @@ function analyze(scored) {
     return {
       verdict: "Possibly Misleading",
       confidence: 20,
-      reasoning: "No relevant or credible coverage found",
+      reasoning: "No strong relevant coverage",
       sources: []
     };
   }
@@ -147,13 +184,11 @@ function analyze(scored) {
   const avgScore = top.reduce((s, a) => s + a.score, 0) / top.length;
   const avgCred = top.reduce((s, a) => s + a.cred, 0) / top.length;
 
-  const consistency = top.length;
-
-  if (avgScore > 6 && avgCred > 2 && consistency >= 5) {
+  if (avgScore > 6 && avgCred > 2) {
     return {
       verdict: "Likely Real",
       confidence: Math.min(95, Math.round(avgScore * 12)),
-      reasoning: "Strong agreement across multiple credible sources",
+      reasoning: "Strong multi-source confirmation",
       sources: top
     };
   }
@@ -162,7 +197,7 @@ function analyze(scored) {
     return {
       verdict: "Unverified",
       confidence: 50,
-      reasoning: "Some relevant coverage but lacks strong confirmation",
+      reasoning: "Partial or inconsistent coverage",
       sources: top
     };
   }
@@ -170,35 +205,46 @@ function analyze(scored) {
   return {
     verdict: "Possibly Misleading",
     confidence: 30,
-    reasoning: "Weak relevance or unreliable sources",
+    reasoning: "Weak or unreliable signals",
     sources: top
   };
 }
 
 /* -------------------------
-   ROUTE
+   API ROUTE (NEVER FAILS)
 ------------------------- */
 app.post("/analyze", async (req, res) => {
+  try {
+    const { text } = req.body;
 
-  const { text } = req.body;
+    if (!text) {
+      return res.json({
+        verdict: "Unverified",
+        confidence: 0,
+        reasoning: "No input",
+        sources: []
+      });
+    }
 
-  if (!text) {
-    return res.json({
+    const articles = await fetchNews(text);
+
+    const ranked = await rank(text, articles);
+
+    const result = analyze(ranked);
+
+    res.json(result);
+
+  } catch (err) {
+    console.error("🔥 SERVER ERROR:", err);
+
+    res.json({
       verdict: "Unverified",
-      confidence: 0,
-      reasoning: "No input",
+      confidence: 10,
+      reasoning: "Server fallback response",
       sources: []
     });
   }
-
-  const articles = await fetchNews(text);
-
-  const ranked = await rank(text, articles);
-
-  const result = analyze(ranked);
-
-  res.json(result);
 });
 
 /* ------------------------- */
-app.listen(PORT, () => console.log("🚀 Smart backend running"));
+app.listen(PORT, () => console.log("🚀 Backend running"));
