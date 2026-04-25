@@ -14,6 +14,32 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
+   CACHE SYSTEM
+------------------------- */
+const cache = new Map();
+const CACHE_TIME = 10 * 60 * 1000; // 10 minutes
+
+function getCache(key) {
+  const data = cache.get(key);
+
+  if (!data) return null;
+
+  if (Date.now() - data.time > CACHE_TIME) {
+    cache.delete(key);
+    return null;
+  }
+
+  return data.value;
+}
+
+function setCache(key, value) {
+  cache.set(key, {
+    value,
+    time: Date.now()
+  });
+}
+
+/* -------------------------
    CLEAN QUERY
 ------------------------- */
 function cleanQuery(text) {
@@ -26,12 +52,18 @@ function cleanQuery(text) {
 }
 
 /* -------------------------
-   FETCH NEWS (SAFE)
+   FETCH NEWS (LIMIT SAFE)
 ------------------------- */
 async function fetchNews(query) {
+  const cached = getCache(query);
+  if (cached) {
+    console.log("⚡ Using cache");
+    return cached;
+  }
+
   try {
-    const gnewsURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
-    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&languages=en&limit=10`;
+    const gnewsURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=5&lang=en&apikey=${GNEWS_API_KEY}`;
+    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&limit=5`;
 
     const [gRes, mRes] = await Promise.allSettled([
       fetch(gnewsURL),
@@ -40,49 +72,45 @@ async function fetchNews(query) {
 
     let articles = [];
 
-    // GNews
     if (gRes.status === "fulfilled") {
       const gData = await gRes.value.json();
-      articles.push(
-        ...(gData.articles || []).map(a => ({
-          title: a.title,
-          url: a.url,
-          source: a.source?.name || "Unknown"
-        }))
-      );
+      articles.push(...(gData.articles || []));
     }
 
-    // Mediastack
     if (mRes.status === "fulfilled") {
       const mData = await mRes.value.json();
-      articles.push(
-        ...(mData.data || []).map(a => ({
-          title: a.title,
-          url: a.url,
-          source: a.source || "Unknown"
-        }))
-      );
+      articles.push(...(mData.data || []));
     }
+
+    const formatted = articles.map(a => ({
+      title: a.title,
+      url: a.url,
+      source: a.source?.name || a.source || "Unknown"
+    }));
 
     // REMOVE DUPLICATES
     const seen = new Set();
-    const unique = articles.filter(a => {
+    const unique = formatted.filter(a => {
       const key = a.title.toLowerCase();
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
 
-    return unique.slice(0, 10);
+    const finalData = unique.slice(0, 8);
+
+    setCache(query, finalData); // SAVE CACHE
+
+    return finalData;
 
   } catch (err) {
-    console.error("Fetch error:", err);
+    console.error(err);
     return [];
   }
 }
 
 /* -------------------------
-   SIMPLE BUT EFFECTIVE SCORING
+   SIMPLE ANALYSIS
 ------------------------- */
 function similarity(a, b) {
   const wordsA = a.split(" ");
@@ -97,107 +125,66 @@ function similarity(a, b) {
   return match / Math.max(wordsA.length, 1);
 }
 
-/* -------------------------
-   SOURCE TRUST
-------------------------- */
-function sourceScore(source = "") {
-  const s = source.toLowerCase();
-
-  if (s.includes("reuters")) return 1;
-  if (s.includes("bbc")) return 0.95;
-  if (s.includes("ap")) return 0.95;
-  if (s.includes("the hindu")) return 0.9;
-  if (s.includes("indian express")) return 0.9;
-  if (s.includes("ndtv")) return 0.85;
-
-  return 0.6;
-}
-
-/* -------------------------
-   ANALYSIS (FAST + STABLE)
-------------------------- */
 function analyze(input, articles) {
   if (!articles.length) {
     return {
       verdict: "Unverified",
       confidence: 10,
-      reasoning: "No coverage found"
+      reasoning: "No coverage"
     };
   }
 
   const query = cleanQuery(input);
 
-  let scores = [];
-
-  for (let a of articles) {
-    const sim = similarity(query, cleanQuery(a.title));
-    const trust = sourceScore(a.source);
-
-    scores.push(sim * trust);
-  }
+  let scores = articles.map(a =>
+    similarity(query, cleanQuery(a.title))
+  );
 
   const avg =
     scores.reduce((a, b) => a + b, 0) / scores.length;
 
-  const strong =
-    scores.filter(s => s > 0.5).length;
-
   let verdict = "Unverified";
 
-  if (avg > 0.6 && strong >= 3)
-    verdict = "Likely Real";
-  else if (avg < 0.3)
-    verdict = "Possibly Misleading";
+  if (avg > 0.6) verdict = "Likely Real";
+  else if (avg < 0.3) verdict = "Possibly Misleading";
 
   return {
     verdict,
     confidence: Math.round(avg * 100),
-    reasoning: `Matched ${strong} sources with decent similarity`
+    reasoning: "Cached + optimized scoring"
   };
 }
 
 /* -------------------------
    ROUTES
 ------------------------- */
-app.get("/", (req, res) => {
-  res.send("✅ Backend Working Perfectly");
-});
-
 app.post("/analyze", async (req, res) => {
-  try {
-    const { text } = req.body;
+  const { text } = req.body;
 
-    if (!text) {
-      return res.json({
-        verdict: "Unverified",
-        confidence: 0,
-        reasoning: "No input",
-        sources: []
-      });
-    }
-
-    const query = cleanQuery(text);
-    const articles = await fetchNews(query);
-    const result = analyze(text, articles);
-
-    res.json({
-      ...result,
-      sources: articles.slice(0, 5)
-    });
-
-  } catch (err) {
-    console.error(err);
-
-    res.json({
-      verdict: "Error",
+  if (!text) {
+    return res.json({
+      verdict: "Unverified",
       confidence: 0,
-      reasoning: "Server crashed",
+      reasoning: "No input",
       sources: []
     });
   }
+
+  const query = cleanQuery(text);
+
+  const articles = await fetchNews(query);
+  const result = analyze(text, articles);
+
+  res.json({
+    ...result,
+    sources: articles
+  });
 });
 
-/* ------------------------- */
+app.get("/", (req, res) => {
+  res.send("✅ API LIMIT SAFE BACKEND RUNNING");
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 Running on port ${PORT}`);
+  console.log("🚀 Running on", PORT);
 });
