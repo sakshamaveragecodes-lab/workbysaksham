@@ -8,7 +8,12 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 
 /* -------------------------
-   FETCH NEWS (Google RSS)
+   CACHE
+------------------------- */
+const cache = new Map();
+
+/* -------------------------
+   FETCH NEWS
 ------------------------- */
 async function fetchNews(query) {
   try {
@@ -18,67 +23,40 @@ async function fetchNews(query) {
 
     const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)];
 
-    return items.slice(0, 20).map(i => {
+    return items.slice(0, 25).map(i => {
       const block = i[1];
 
       const title = (block.match(/<title>(.*?)<\/title>/)?.[1] || "")
         .replace(/<!\[CDATA\[|\]\]>/g, "");
 
       const link = block.match(/<link>(.*?)<\/link>/)?.[1] || "";
-
       const source = title.split(" - ").pop();
 
       return { title, url: link, source };
     });
 
-  } catch (err) {
-    console.error("❌ fetchNews error:", err);
+  } catch {
     return [];
   }
 }
 
 /* -------------------------
-   SAFE EMBEDDING
+   CLEAN WORDS
 ------------------------- */
-async function getEmbedding(text) {
-  try {
-    if (!process.env.HF_API_KEY) throw new Error("No API key");
-
-    const res = await fetch(
-      "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${process.env.HF_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ inputs: text })
-      }
-    );
-
-    const data = await res.json();
-
-    if (!Array.isArray(data)) throw new Error("Invalid embedding");
-
-    return data;
-
-  } catch (err) {
-    return null; // 🔥 fallback trigger
-  }
+function words(text) {
+  return text.toLowerCase().split(" ").filter(w => w.length > 2);
 }
 
 /* -------------------------
-   COSINE SIMILARITY
+   SIMILARITY
 ------------------------- */
-function cosineSim(a, b) {
-  try {
-    const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
-    const magA = Math.sqrt(a.reduce((s, v) => s + v * v, 0));
-    const magB = Math.sqrt(b.reduce((s, v) => s + v * v, 0));
-    return dot / (magA * magB);
-  } catch {
-    return 0;
-  }
+function similarity(a, b) {
+  const w1 = words(a);
+  const w2 = words(b);
+
+  const common = w1.filter(w => w2.includes(w)).length;
+
+  return common / Math.max(w1.length, 1);
 }
 
 /* -------------------------
@@ -87,131 +65,169 @@ function cosineSim(a, b) {
 function sourceScore(source) {
   const s = source.toLowerCase();
 
-  const high = ["reuters", "bbc", "ap news", "associated press", "al jazeera"];
-  const medium = ["the hindu", "indian express", "times of india", "hindustan times"];
-
-  if (high.some(x => s.includes(x))) return 3;
-  if (medium.some(x => s.includes(x))) return 2;
+  if (["reuters","bbc","ap news","associated press"].some(x => s.includes(x))) return 3;
+  if (["the hindu","indian express","times of india"].some(x => s.includes(x))) return 2;
   return 1;
 }
 
 /* -------------------------
-   FILTER BAD CONTENT
+   FILTER NOISE
 ------------------------- */
 function penalty(title) {
   const t = title.toLowerCase();
 
-  const bad = ["movie","film","netflix","review","ranking","celebrity"];
-  const opinion = ["opinion","editorial"];
-  const rumor = ["rumor","might","could","speculation"];
+  const junk = ["movie","film","review","ranking","celebrity"];
+  const weak = ["rumor","might","could","speculation"];
 
   let p = 0;
 
-  if (bad.some(w => t.includes(w))) p += 4;
-  if (opinion.some(w => t.includes(w))) p += 2;
-  if (rumor.some(w => t.includes(w))) p += 1;
+  if (junk.some(w => t.includes(w))) p += 4;
+  if (weak.some(w => t.includes(w))) p += 1;
 
   return p;
 }
 
 /* -------------------------
-   KEYWORD MATCH (FALLBACK)
+   PLAUSIBILITY
 ------------------------- */
-function keywordScore(query, title) {
-  const q = query.toLowerCase().split(" ");
-  const t = title.toLowerCase();
+function plausibilityPenalty(query) {
+  const q = query.toLowerCase();
 
-  let count = 0;
-  q.forEach(w => {
-    if (t.includes(w)) count++;
+  const extreme = [
+    "alien invasion",
+    "moon made of diamond",
+    "flat earth",
+    "time travel",
+    "teleportation"
+  ];
+
+  return extreme.some(x => q.includes(x)) ? 4 : 0;
+}
+
+/* -------------------------
+   CLUSTERING (KEY FEATURE)
+------------------------- */
+function clusterArticles(articles) {
+  const clusters = [];
+
+  articles.forEach(article => {
+    let placed = false;
+
+    for (let cluster of clusters) {
+      if (similarity(cluster[0].title, article.title) > 0.5) {
+        cluster.push(article);
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) {
+      clusters.push([article]);
+    }
   });
 
-  return count / q.length;
+  return clusters;
 }
 
 /* -------------------------
-   SMART RANKING (AI + FALLBACK)
+   STANCE DETECTION
 ------------------------- */
-async function rank(query, articles) {
+function stanceScore(title) {
+  const t = title.toLowerCase();
 
-  const queryVec = await getEmbedding(query);
+  const positive = ["confirmed","agrees","approved","signed"];
+  const negative = ["denies","rejects","fake","false"];
 
-  const scored = [];
+  if (positive.some(w => t.includes(w))) return 1;
+  if (negative.some(w => t.includes(w))) return -1;
 
-  for (let a of articles) {
-
-    let sim = 0;
-
-    if (queryVec) {
-      const vec = await getEmbedding(a.title);
-      if (vec) sim = cosineSim(queryVec, vec);
-    }
-
-    // 🔥 fallback if AI fails
-    if (!sim || sim === 0) {
-      sim = keywordScore(query, a.title);
-    }
-
-    const cred = sourceScore(a.source);
-    const pen = penalty(a.title);
-
-    const score = (sim * 10) + cred - pen;
-
-    if (sim > 0.2) {
-      scored.push({ ...a, score, cred });
-    }
-  }
-
-  return scored.sort((a, b) => b.score - a.score);
+  return 0;
 }
 
 /* -------------------------
-   FINAL DECISION
+   RANK
 ------------------------- */
-function analyze(scored) {
+function rank(query, articles) {
+  return articles
+    .map(a => {
+      const sim = similarity(query, a.title);
+      const cred = sourceScore(a.source);
+      const pen = penalty(a.title);
 
-  if (!scored.length) {
+      const score = (sim * 10) + cred - pen;
+
+      return { ...a, score, cred, sim };
+    })
+    .filter(a => a.sim > 0.2)
+    .sort((a, b) => b.score - a.score);
+}
+
+/* -------------------------
+   ELITE ANALYSIS
+------------------------- */
+function analyze(query, ranked) {
+
+  if (!ranked.length) {
     return {
       verdict: "Possibly Misleading",
       confidence: 20,
-      reasoning: "No strong relevant coverage",
+      reasoning: "No credible coverage",
       sources: []
     };
   }
 
-  const top = scored.slice(0, 8);
+  const clusters = clusterArticles(ranked);
+  const topCluster = clusters.sort((a,b) => b.length - a.length)[0];
 
-  const avgScore = top.reduce((s, a) => s + a.score, 0) / top.length;
-  const avgCred = top.reduce((s, a) => s + a.cred, 0) / top.length;
+  const coverage = topCluster.length;
 
-  if (avgScore > 6 && avgCred > 2) {
+  const avgCred = topCluster.reduce((s, a) => s + a.cred, 0) / coverage;
+  const avgScore = topCluster.reduce((s, a) => s + a.score, 0) / coverage;
+
+  const stanceTotal = topCluster.reduce((s, a) => s + stanceScore(a.title), 0);
+
+  const plausibility = plausibilityPenalty(query);
+
+  // 🔥 contradiction detection
+  const contradiction = Math.abs(stanceTotal) < coverage * 0.3;
+
+  if (coverage < 3 || avgCred < 1.8) {
     return {
-      verdict: "Likely Real",
-      confidence: Math.min(95, Math.round(avgScore * 12)),
-      reasoning: "Strong multi-source confirmation",
-      sources: top
+      verdict: "Possibly Misleading",
+      confidence: 25,
+      reasoning: "Weak or low-quality coverage",
+      sources: topCluster.slice(0, 6)
     };
   }
 
-  if (avgScore > 4) {
+  if (contradiction) {
     return {
       verdict: "Unverified",
-      confidence: 50,
-      reasoning: "Partial or inconsistent coverage",
-      sources: top
+      confidence: 45,
+      reasoning: "Conflicting reports across sources",
+      sources: topCluster.slice(0, 6)
+    };
+  }
+
+  if ((avgScore - plausibility) > 6 && avgCred > 2) {
+    return {
+      verdict: "Likely Real",
+      confidence: Math.min(92, Math.round((avgScore - plausibility) * 10)),
+      reasoning: "Strong agreement across credible sources",
+      sources: topCluster.slice(0, 8)
     };
   }
 
   return {
     verdict: "Possibly Misleading",
     confidence: 30,
-    reasoning: "Weak or unreliable signals",
-    sources: top
+    reasoning: "Low confidence or implausible claim",
+    sources: topCluster.slice(0, 6)
   };
 }
 
 /* -------------------------
-   API ROUTE (NEVER FAILS)
+   ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
   try {
@@ -226,25 +242,31 @@ app.post("/analyze", async (req, res) => {
       });
     }
 
+    if (cache.has(text)) {
+      return res.json(cache.get(text));
+    }
+
     const articles = await fetchNews(text);
+    const ranked = rank(text, articles);
+    const result = analyze(text, ranked);
 
-    const ranked = await rank(text, articles);
-
-    const result = analyze(ranked);
+    cache.set(text, result);
 
     res.json(result);
 
   } catch (err) {
-    console.error("🔥 SERVER ERROR:", err);
+    console.error(err);
 
     res.json({
       verdict: "Unverified",
       confidence: 10,
-      reasoning: "Server fallback response",
+      reasoning: "Fallback response",
       sources: []
     });
   }
 });
 
 /* ------------------------- */
-app.listen(PORT, () => console.log("🚀 Backend running"));
+app.listen(PORT, () => {
+  console.log("🚀 Elite backend running");
+});
