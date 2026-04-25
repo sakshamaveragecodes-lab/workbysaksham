@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors({ origin: "*" }));
+app.use(cors());
 app.use(express.json());
 
 const HF_API_KEY = process.env.HF_API_KEY;
@@ -14,7 +14,7 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   🔑 KEYWORDS
+   🔑 UTIL
 ------------------------- */
 function extractKeywords(text) {
   return text
@@ -26,72 +26,66 @@ function extractKeywords(text) {
 }
 
 /* -------------------------
-   🌐 FETCH NEWS (MULTI QUERY)
+   🌐 FETCH NEWS
 ------------------------- */
 async function fetchNews(text) {
-  const keywords = extractKeywords(text);
+  try {
+    const keywords = extractKeywords(text);
+    const query = keywords.join(" ");
 
-  const queries = [
-    keywords.join(" "),
-    keywords.slice(0, 3).join(" "),
-    text.slice(0, 60)
-  ];
-
-  let results = [];
-
-  for (let q of queries) {
     const [gnews, mediastack] = await Promise.all([
-      fetch(`https://gnews.io/api/v4/search?q=${q}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
+      fetch(`https://gnews.io/api/v4/search?q=${query}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
         .then(r => r.json())
         .then(d => d.articles || [])
         .catch(() => []),
 
-      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${q}&limit=5`)
+      fetch(`http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=5`)
         .then(r => r.json())
         .then(d => d.data || [])
         .catch(() => [])
     ]);
 
-    results.push(
+    const combined = [
       ...gnews.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source?.name || "Unknown",
-        date: new Date(a.publishedAt)
+        source: a.source?.name || "Unknown"
       })),
       ...mediastack.map(a => ({
         title: a.title,
         desc: a.description,
         url: a.url,
-        source: a.source,
-        date: new Date(a.published_at)
+        source: a.source
       }))
-    );
-  }
+    ];
 
-  // remove duplicates
-  const seen = new Set();
-  return results.filter(a => {
-    const key = a.title?.toLowerCase().slice(0, 80);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    // dedupe
+    const seen = new Set();
+    return combined.filter(a => {
+      const key = a.title?.toLowerCase().slice(0, 80);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  } catch {
+    return [];
+  }
 }
 
 /* -------------------------
-   🧠 SAFE LLM (WITH TIMEOUT + FALLBACK)
+   🧠 AI FACT CHECK
 ------------------------- */
-async function factCheck(text, articles) {
+async function aiCheck(text, articles) {
 
   const context = articles
     .slice(0, 5)
-    .map((a, i) => `(${i + 1}) ${a.title}`)
+    .map((a, i) => `${i + 1}. ${a.title}`)
     .join("\n");
 
   const prompt = `
-Fact check this claim:
+Fact check:
 
 "${text}"
 
@@ -107,7 +101,7 @@ Return JSON:
 `;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
     const res = await fetch(
@@ -131,51 +125,61 @@ Return JSON:
     const data = await res.json();
     const output = data[0]?.generated_text || "";
 
-    try {
-      return JSON.parse(output);
-    } catch {
-      return {
-        verdict: "Unverified",
-        confidence: 55,
-        reasoning: output.slice(0, 150) || "Model unclear"
-      };
-    }
+    return JSON.parse(output);
 
-  } catch (err) {
-    console.log("⚠️ HF failed → fallback");
+  } catch {
+    return null;
+  }
+}
 
-    // 🔥 fallback logic
-    const trusted =
-      ["bbc","reuters","ap","the hindu","indian express"]
-        .some(s => articles[0]?.source?.toLowerCase().includes(s));
+/* -------------------------
+   🔁 FALLBACK LOGIC
+------------------------- */
+function fallbackCheck(articles) {
 
+  if (articles.length === 0) {
     return {
-      verdict: trusted ? "Likely Real" : "Unverified",
-      confidence: trusted ? 60 : 40,
-      reasoning: "Fallback used due to AI failure"
+      verdict: "Unverified",
+      confidence: 20,
+      reasoning: "No sources found"
     };
   }
+
+  const trustedList = ["bbc","reuters","ap","the hindu","indian express"];
+
+  const trusted = articles.some(a =>
+    trustedList.some(s => a.source?.toLowerCase().includes(s))
+  );
+
+  return {
+    verdict: trusted ? "Likely Real" : "Unverified",
+    confidence: trusted ? 65 : 40,
+    reasoning: trusted
+      ? "Covered by trusted sources"
+      : "Limited coverage"
+  };
 }
 
 /* -------------------------
    📊 ANALYZE
 ------------------------- */
 async function analyze(text) {
+
   const articles = await fetchNews(text);
 
-  if (articles.length === 0) {
-    return {
-      verdict: "Unverified",
-      confidence: 20,
-      reasoning: "No sources found",
-      sources: []
-    };
+  // Try AI first
+  const aiResult = await aiCheck(text, articles);
+
+  let finalResult;
+
+  if (aiResult && aiResult.verdict) {
+    finalResult = aiResult;
+  } else {
+    finalResult = fallbackCheck(articles);
   }
 
-  const result = await factCheck(text, articles);
-
   return {
-    ...result,
+    ...finalResult,
     sources: articles.slice(0, 5)
   };
 }
@@ -184,7 +188,7 @@ async function analyze(text) {
    🚀 ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Hybrid Stable Fact Checker Running");
+  res.send("🚀 Fact Checker Running");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -202,11 +206,10 @@ app.post("/analyze", async (req, res) => {
 
     const result = await analyze(text);
 
-    // 🔥 ALWAYS RETURN SUCCESS
     res.json(result);
 
   } catch (err) {
-    console.error("ERROR:", err.message);
+    console.error(err);
 
     res.json({
       verdict: "Unverified",
@@ -217,9 +220,5 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
-/* ------------------------- */
 const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, () => {
-  console.log(`🔥 Running on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Running on ${PORT}`));

@@ -1,198 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Veritas AI</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Veritas AI - Fact Checker</title>
 
-<style>
-* {
-  box-sizing: border-box;
-}
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: white;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      justify-content: center;
+    }
 
-body {
-  margin: 0;
-  font-family: 'Segoe UI', sans-serif;
-  background: linear-gradient(135deg, #0f172a, #1e293b);
-  color: white;
-}
+    .container {
+      max-width: 700px;
+      width: 100%;
+      padding: 20px;
+    }
 
-.container {
-  max-width: 900px;
-  margin: auto;
-  padding: 20px;
-  text-align: center;
-}
+    h1 {
+      text-align: center;
+      margin-bottom: 20px;
+    }
 
-h1 {
-  font-size: 2.5rem;
-  margin-bottom: 10px;
-}
+    textarea {
+      width: 100%;
+      height: 120px;
+      padding: 10px;
+      border-radius: 8px;
+      border: none;
+      margin-bottom: 10px;
+      font-size: 16px;
+    }
 
-.subtitle {
-  opacity: 0.7;
-  margin-bottom: 20px;
-}
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+    }
 
-input {
-  width: 100%;
-  padding: 15px;
-  border-radius: 12px;
-  border: none;
-  margin-top: 10px;
-  font-size: 16px;
-}
+    button:hover {
+      background: #2563eb;
+    }
 
-button {
-  padding: 12px 20px;
-  border: none;
-  border-radius: 12px;
-  background: #6366f1;
-  color: white;
-  margin-top: 10px;
-  cursor: pointer;
-  font-size: 16px;
-}
+    .result {
+      margin-top: 20px;
+      padding: 15px;
+      background: #1e293b;
+      border-radius: 10px;
+    }
 
-button:hover {
-  background: #4f46e5;
-}
+    .sources {
+      margin-top: 15px;
+    }
 
-.card {
-  background: rgba(255,255,255,0.05);
-  backdrop-filter: blur(10px);
-  padding: 20px;
-  border-radius: 15px;
-  margin-top: 20px;
-  text-align: left;
-}
+    .source {
+      margin-bottom: 10px;
+    }
 
-.badges {
-  margin: 10px 0;
-}
+    a {
+      color: #60a5fa;
+      text-decoration: none;
+    }
 
-.badge {
-  padding: 6px 12px;
-  border-radius: 8px;
-  margin-right: 8px;
-  display: inline-block;
-}
-
-.real { background: #16a34a; }
-.fake { background: #dc2626; }
-.suspicious { background: #f59e0b; }
-
-.sources a {
-  color: #38bdf8;
-  text-decoration: none;
-}
-
-.sources a:hover {
-  text-decoration: underline;
-}
-
-.loading {
-  margin-top: 20px;
-  opacity: 0.7;
-}
-
-.error {
-  color: #f87171;
-  margin-top: 20px;
-}
-
-@media (max-width: 600px) {
-  h1 { font-size: 1.8rem; }
-}
-</style>
+    .loading {
+      text-align: center;
+      margin-top: 10px;
+      color: #94a3b8;
+    }
+  </style>
 </head>
 
 <body>
+  <div class="container">
+    <h1>🧠 Veritas AI</h1>
 
-<div class="container">
-  <h1>🧠 Veritas AI</h1>
-  <p class="subtitle">Advanced Fake News Detection</p>
+    <textarea id="input" placeholder="Enter news or claim..."></textarea>
 
-  <input id="input" placeholder="Paste headline or full news article..." />
-  <button onclick="runAnalysis()">Analyze</button>
+    <button onclick="analyzeNews()">Analyze</button>
 
-  <div id="output"></div>
-</div>
+    <div class="loading" id="loading"></div>
 
-<script>
-const API = "https://workbysaksham.onrender.com"; // your backend
+    <div class="result" id="result" style="display:none;"></div>
+  </div>
 
-async function runAnalysis() {
-  const input = document.getElementById("input").value.trim();
-  const output = document.getElementById("output");
+  <script>
+    const API_URL = "https://workbysaksham.onrender.com"; // 🔴 CHANGE THIS
 
-  if (!input) {
-    alert("Please enter news text");
-    return;
-  }
+    async function analyzeNews() {
+      const text = document.getElementById("input").value.trim();
+      const resultDiv = document.getElementById("result");
+      const loading = document.getElementById("loading");
 
-  output.innerHTML = `<div class="loading">⏳ Analyzing...</div>`;
+      if (!text) {
+        alert("Enter something first");
+        return;
+      }
 
-  try {
-    const res = await fetch(API + "/analyze", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ text: input })
-    });
+      resultDiv.style.display = "none";
+      loading.innerText = "Analyzing...";
 
-    const data = await res.json();
+      try {
+        const res = await fetch(`${API_URL}/analyze`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ text })
+        });
 
-    if (!res.ok) {
-      throw new Error(data.error || "API error");
+        const data = await res.json();
+
+        console.log("API:", data); // DEBUG
+
+        loading.innerText = "";
+
+        resultDiv.style.display = "block";
+
+        resultDiv.innerHTML = `
+          <h2>Verdict: ${data.verdict}</h2>
+          <p><strong>Confidence:</strong> ${data.confidence}%</p>
+          <p>${data.reasoning}</p>
+
+          <div class="sources">
+            <h3>Sources:</h3>
+            ${
+              data.sources?.length
+                ? data.sources.map(s => `
+                  <div class="source">
+                    🔗 <a href="${s.url}" target="_blank">${s.title}</a><br/>
+                    <small>${s.source}</small>
+                  </div>
+                `).join("")
+                : "<p>No sources available</p>"
+            }
+          </div>
+        `;
+
+      } catch (err) {
+        console.error(err);
+
+        loading.innerText = "";
+        resultDiv.style.display = "block";
+
+        resultDiv.innerHTML = `
+          <h2>Error</h2>
+          <p>Unable to connect to server</p>
+        `;
+      }
     }
-
-    const cls =
-      data.verdict === "Real" ? "real" :
-      data.verdict === "Fake" ? "fake" : "suspicious";
-
-    output.innerHTML = `
-      <div class="card">
-        <h2>${data.verdict}</h2>
-
-        <div class="badges">
-          <span class="badge ${cls}">Confidence: ${data.confidence}%</span>
-          <span class="badge">Agreement: ${data.agreement}%</span>
-          <span class="badge">Bias: ${data.bias}</span>
-        </div>
-
-        <p>${escapeHTML(data.reason)}</p>
-
-        <h3>🔎 Verify Yourself</h3>
-        <div class="sources">
-          ${data.sources && data.sources.length
-            ? data.sources.map(s =>
-              `<p><a href="${s.url}" target="_blank">${escapeHTML(s.title)}</a></p>`
-            ).join("")
-            : "<p>No sources available</p>"
-          }
-        </div>
-      </div>
-    `;
-
-  } catch (err) {
-    console.error(err);
-    output.innerHTML = `<div class="error">⚠️ Failed to analyze. Try again.</div>`;
-  }
-}
-
-// prevent XSS
-function escapeHTML(str) {
-  return str.replace(/[&<>"']/g, tag => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  }[tag]));
-}
-</script>
-
+  </script>
 </body>
 </html>
