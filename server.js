@@ -14,14 +14,13 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
-   CACHE SYSTEM
+   CACHE
 ------------------------- */
 const cache = new Map();
-const CACHE_TIME = 10 * 60 * 1000; // 10 minutes
+const CACHE_TIME = 10 * 60 * 1000;
 
 function getCache(key) {
   const data = cache.get(key);
-
   if (!data) return null;
 
   if (Date.now() - data.time > CACHE_TIME) {
@@ -33,10 +32,7 @@ function getCache(key) {
 }
 
 function setCache(key, value) {
-  cache.set(key, {
-    value,
-    time: Date.now()
-  });
+  cache.set(key, { value, time: Date.now() });
 }
 
 /* -------------------------
@@ -46,18 +42,16 @@ function cleanQuery(text) {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9 ]/g, "")
-    .split(" ")
-    .slice(0, 10)
-    .join(" ");
+    .trim();
 }
 
 /* -------------------------
-   FETCH NEWS (LIMIT SAFE)
+   FETCH NEWS (SAFE)
 ------------------------- */
 async function fetchNews(query) {
   const cached = getCache(query);
   if (cached) {
-    console.log("⚡ Using cache");
+    console.log("⚡ Cache hit:", query);
     return cached;
   }
 
@@ -72,57 +66,93 @@ async function fetchNews(query) {
 
     let articles = [];
 
+    // GNews
     if (gRes.status === "fulfilled") {
       const gData = await gRes.value.json();
-      articles.push(...(gData.articles || []));
+      console.log("GNews:", gData);
+      articles.push(
+        ...(gData.articles || []).map(a => ({
+          title: a.title,
+          url: a.url,
+          source: a.source?.name || "Unknown"
+        }))
+      );
     }
 
+    // Mediastack
     if (mRes.status === "fulfilled") {
       const mData = await mRes.value.json();
-      articles.push(...(mData.data || []));
+      console.log("Mediastack:", mData);
+      articles.push(
+        ...(mData.data || []).map(a => ({
+          title: a.title,
+          url: a.url,
+          source: a.source || "Unknown"
+        }))
+      );
     }
-
-    const formatted = articles.map(a => ({
-      title: a.title,
-      url: a.url,
-      source: a.source?.name || a.source || "Unknown"
-    }));
 
     // REMOVE DUPLICATES
     const seen = new Set();
-    const unique = formatted.filter(a => {
-      const key = a.title.toLowerCase();
-      if (seen.has(key)) return false;
+    const unique = articles.filter(a => {
+      const key = a.title?.toLowerCase();
+      if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
 
     const finalData = unique.slice(0, 8);
 
-    setCache(query, finalData); // SAVE CACHE
+    setCache(query, finalData);
 
     return finalData;
 
   } catch (err) {
-    console.error(err);
+    console.error("Fetch error:", err);
     return [];
   }
+}
+
+/* -------------------------
+   FALLBACK QUERY SYSTEM
+------------------------- */
+async function getArticlesSmart(input) {
+  const base = cleanQuery(input);
+
+  const queries = [
+    base,
+    base.split(" ").slice(0, 2).join(" "),
+    base.split(" ")[0]
+  ];
+
+  for (let q of queries) {
+    if (!q) continue;
+
+    console.log("Trying query:", q);
+
+    const result = await fetchNews(q);
+
+    if (result.length > 0) {
+      return result;
+    }
+  }
+
+  return [];
 }
 
 /* -------------------------
    SIMPLE ANALYSIS
 ------------------------- */
 function similarity(a, b) {
-  const wordsA = a.split(" ");
-  const wordsB = b.split(" ");
+  const A = a.split(" ");
+  const B = b.split(" ");
 
   let match = 0;
-
-  for (let w of wordsA) {
-    if (wordsB.includes(w)) match++;
+  for (let w of A) {
+    if (B.includes(w)) match++;
   }
 
-  return match / Math.max(wordsA.length, 1);
+  return match / Math.max(A.length, 1);
 }
 
 function analyze(input, articles) {
@@ -130,13 +160,13 @@ function analyze(input, articles) {
     return {
       verdict: "Unverified",
       confidence: 10,
-      reasoning: "No coverage"
+      reasoning: "No news coverage found"
     };
   }
 
   const query = cleanQuery(input);
 
-  let scores = articles.map(a =>
+  const scores = articles.map(a =>
     similarity(query, cleanQuery(a.title))
   );
 
@@ -151,7 +181,7 @@ function analyze(input, articles) {
   return {
     verdict,
     confidence: Math.round(avg * 100),
-    reasoning: "Cached + optimized scoring"
+    reasoning: `Matched ${articles.length} articles`
   };
 }
 
@@ -159,30 +189,40 @@ function analyze(input, articles) {
    ROUTES
 ------------------------- */
 app.post("/analyze", async (req, res) => {
-  const { text } = req.body;
+  try {
+    const { text } = req.body;
 
-  if (!text) {
-    return res.json({
-      verdict: "Unverified",
+    if (!text) {
+      return res.json({
+        verdict: "Unverified",
+        confidence: 0,
+        reasoning: "No input",
+        sources: []
+      });
+    }
+
+    const articles = await getArticlesSmart(text);
+    const result = analyze(text, articles);
+
+    res.json({
+      ...result,
+      sources: articles
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    res.json({
+      verdict: "Error",
       confidence: 0,
-      reasoning: "No input",
+      reasoning: "Server error",
       sources: []
     });
   }
-
-  const query = cleanQuery(text);
-
-  const articles = await fetchNews(query);
-  const result = analyze(text, articles);
-
-  res.json({
-    ...result,
-    sources: articles
-  });
 });
 
 app.get("/", (req, res) => {
-  res.send("✅ API LIMIT SAFE BACKEND RUNNING");
+  res.send("✅ FULLY FIXED BACKEND RUNNING");
 });
 
 app.listen(PORT, () => {
