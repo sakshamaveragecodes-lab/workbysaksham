@@ -40,16 +40,25 @@ async function fetchNews(query) {
     });
 
   } catch (err) {
-    console.log(err);
+    console.log("Fetch error:", err.message);
     return [];
   }
 }
 
 /* -------------------------
-   FILTER + SCORE
+   SYNONYMS (SMART MATCHING)
+------------------------- */
+const synonyms = {
+  usa: ["us", "usa", "america"],
+  ceasefire: ["ceasefire", "truce", "deal", "agreement"],
+  iran: ["iran"]
+};
+
+/* -------------------------
+   FILTER + ENTITY MATCHING
 ------------------------- */
 function filterArticles(query, articles) {
-  const words = clean(query).split(" ");
+  const words = clean(query).split(" ").filter(w => w.length > 2);
 
   const blacklist = [
     "movie","movies","film","review","ranking",
@@ -65,21 +74,29 @@ function filterArticles(query, articles) {
     .map(a => {
       const title = a.title.toLowerCase();
 
-      let score = 0;
+      let matchCount = 0;
 
-      // keyword match
+      // ✅ smart keyword + synonym matching
       words.forEach(w => {
-        if (title.includes(w)) score++;
+        const group = synonyms[w] || [w];
+
+        if (group.some(g => title.includes(g))) {
+          matchCount++;
+        }
       });
 
-      // remove junk
+      let score = matchCount;
+
+      // ❌ remove junk
       if (blacklist.some(w => title.includes(w))) score -= 3;
 
-      // penalize weak claims
+      // ⚠️ penalize weak claims
       if (weakWords.some(w => title.includes(w))) score -= 1;
 
-      return { ...a, score };
+      return { ...a, score, matchCount };
     })
+    // 🔥 require multiple keyword matches
+    .filter(a => a.matchCount >= Math.ceil(words.length / 2))
     .filter(a => a.score > 0)
     .sort((a, b) => b.score - a.score);
 }
@@ -91,7 +108,6 @@ function analyze(query, articles) {
 
   const relevant = filterArticles(query, articles);
 
-  // credible sources list
   const credible = [
     "reuters","bbc","associated press","ap news",
     "the hindu","indian express","al jazeera",
@@ -102,7 +118,7 @@ function analyze(query, articles) {
     return {
       verdict: "Possibly Misleading",
       confidence: 20,
-      reasoning: "No credible or relevant news coverage found",
+      reasoning: "No strong or relevant news coverage found",
       sources: articles.slice(0, 5)
     };
   }
@@ -118,7 +134,7 @@ function analyze(query, articles) {
 
   const ratio = credibilityScore / relevant.length;
 
-  // speculative topic detection
+  // ⚠️ speculative topics
   const speculativeWords = [
     "alien","ufo","ghost","time travel",
     "conspiracy","end of world"
@@ -128,7 +144,7 @@ function analyze(query, articles) {
     return {
       verdict: "Unverified",
       confidence: 25,
-      reasoning: "Topic is speculative with no confirmed evidence",
+      reasoning: "Speculative topic with no confirmed evidence",
       sources: relevant.slice(0, 5)
     };
   }
@@ -137,7 +153,7 @@ function analyze(query, articles) {
     return {
       verdict: "Possibly Misleading",
       confidence: 30,
-      reasoning: "Low credibility sources or weak evidence",
+      reasoning: "Low credibility or weak supporting evidence",
       sources: relevant.slice(0, 5)
     };
   }
@@ -163,28 +179,43 @@ function analyze(query, articles) {
    ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
-  const { text } = req.body;
+  try {
+    const { text } = req.body;
 
-  if (!text) {
-    return res.json({
-      verdict: "Unverified",
+    if (!text) {
+      return res.json({
+        verdict: "Unverified",
+        confidence: 0,
+        reasoning: "No input provided",
+        sources: []
+      });
+    }
+
+    const articles = await fetchNews(text);
+
+    console.log("Fetched:", articles.length);
+
+    const result = analyze(text, articles);
+
+    res.json(result);
+
+  } catch (err) {
+    console.log(err);
+
+    res.json({
+      verdict: "Error",
       confidence: 0,
-      reasoning: "No input provided",
+      reasoning: "Server error",
       sources: []
     });
   }
-
-  const articles = await fetchNews(text);
-  const result = analyze(text, articles);
-
-  res.json(result);
 });
 
 /* -------------------------
    ROOT
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("VERITAS AI BACKEND RUNNING 🚀");
+  res.send("VERITAS AI FINAL BACKEND 🚀");
 });
 
 app.listen(PORT, () => {
