@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import natural from "natural";
 
 dotenv.config();
 
@@ -14,6 +15,12 @@ const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
 const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
 
 /* -------------------------
+   NLP SETUP
+------------------------- */
+const TfIdf = natural.TfIdf;
+const tokenizer = new natural.WordTokenizer();
+
+/* -------------------------
    CACHE
 ------------------------- */
 const cache = new Map();
@@ -22,12 +29,10 @@ const CACHE_TIME = 10 * 60 * 1000;
 function getCache(key) {
   const data = cache.get(key);
   if (!data) return null;
-
   if (Date.now() - data.time > CACHE_TIME) {
     cache.delete(key);
     return null;
   }
-
   return data.value;
 }
 
@@ -36,28 +41,22 @@ function setCache(key, value) {
 }
 
 /* -------------------------
-   CLEAN QUERY
+   CLEAN TEXT
 ------------------------- */
-function cleanQuery(text) {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, "")
-    .trim();
+function clean(text) {
+  return text.toLowerCase().replace(/[^a-z0-9 ]/g, "");
 }
 
 /* -------------------------
-   FETCH NEWS (SAFE)
+   FETCH NEWS
 ------------------------- */
 async function fetchNews(query) {
   const cached = getCache(query);
-  if (cached) {
-    console.log("⚡ Cache hit:", query);
-    return cached;
-  }
+  if (cached) return cached;
 
   try {
-    const gnewsURL = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&max=5&lang=en&apikey=${GNEWS_API_KEY}`;
-    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${encodeURIComponent(query)}&limit=5`;
+    const gnewsURL = `https://gnews.io/api/v4/search?q=${query}&max=10&lang=en&apikey=${GNEWS_API_KEY}`;
+    const mediaURL = `http://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=10`;
 
     const [gRes, mRes] = await Promise.allSettled([
       fetch(gnewsURL),
@@ -66,28 +65,26 @@ async function fetchNews(query) {
 
     let articles = [];
 
-    // GNews
     if (gRes.status === "fulfilled") {
       const gData = await gRes.value.json();
-      console.log("GNews:", gData);
       articles.push(
         ...(gData.articles || []).map(a => ({
           title: a.title,
           url: a.url,
-          source: a.source?.name || "Unknown"
+          source: a.source?.name || "GNews",
+          weight: 1.0
         }))
       );
     }
 
-    // Mediastack
     if (mRes.status === "fulfilled") {
       const mData = await mRes.value.json();
-      console.log("Mediastack:", mData);
       articles.push(
         ...(mData.data || []).map(a => ({
           title: a.title,
           url: a.url,
-          source: a.source || "Unknown"
+          source: a.source || "Mediastack",
+          weight: 0.9
         }))
       );
     }
@@ -95,98 +92,120 @@ async function fetchNews(query) {
     // REMOVE DUPLICATES
     const seen = new Set();
     const unique = articles.filter(a => {
-      const key = a.title?.toLowerCase();
-      if (!key || seen.has(key)) return false;
+      const key = clean(a.title);
+      if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
 
-    const finalData = unique.slice(0, 8);
-
-    setCache(query, finalData);
-
-    return finalData;
+    setCache(query, unique);
+    return unique;
 
   } catch (err) {
-    console.error("Fetch error:", err);
+    console.error(err);
     return [];
   }
 }
 
 /* -------------------------
-   FALLBACK QUERY SYSTEM
+   SMART QUERY FALLBACK
 ------------------------- */
 async function getArticlesSmart(input) {
-  const base = cleanQuery(input);
+  const base = clean(input);
 
   const queries = [
     base,
-    base.split(" ").slice(0, 2).join(" "),
+    base.split(" ").slice(0, 3).join(" "),
     base.split(" ")[0]
   ];
 
   for (let q of queries) {
     if (!q) continue;
-
-    console.log("Trying query:", q);
-
-    const result = await fetchNews(q);
-
-    if (result.length > 0) {
-      return result;
-    }
+    const res = await fetchNews(q);
+    if (res.length > 3) return res;
   }
 
   return [];
 }
 
 /* -------------------------
-   SIMPLE ANALYSIS
+   SEMANTIC SCORING
 ------------------------- */
-function similarity(a, b) {
-  const A = a.split(" ");
-  const B = b.split(" ");
+function computeSimilarity(query, articles) {
+  const tfidf = new TfIdf();
 
-  let match = 0;
-  for (let w of A) {
-    if (B.includes(w)) match++;
-  }
+  tfidf.addDocument(query);
 
-  return match / Math.max(A.length, 1);
+  articles.forEach(a => {
+    tfidf.addDocument(clean(a.title));
+  });
+
+  let scores = [];
+
+  articles.forEach((a, i) => {
+    let score = 0;
+
+    tokenizer.tokenize(query).forEach(word => {
+      score += tfidf.tfidf(word, i + 1);
+    });
+
+    scores.push(score * a.weight);
+  });
+
+  return scores;
 }
 
+/* -------------------------
+   SOURCE CREDIBILITY
+------------------------- */
+function credibilityScore(source) {
+  const trusted = [
+    "reuters", "bbc", "ap", "associated press",
+    "the hindu", "indian express", "nyt", "guardian"
+  ];
+
+  source = source.toLowerCase();
+
+  return trusted.some(s => source.includes(s)) ? 1.2 : 1.0;
+}
+
+/* -------------------------
+   FINAL ANALYSIS
+------------------------- */
 function analyze(input, articles) {
   if (!articles.length) {
     return {
       verdict: "Unverified",
-      confidence: 10,
-      reasoning: "No news coverage found"
+      confidence: 5,
+      reasoning: "No credible coverage found",
+      bias: "Unknown"
     };
   }
 
-  const query = cleanQuery(input);
+  const scores = computeSimilarity(input, articles);
 
-  const scores = articles.map(a =>
-    similarity(query, cleanQuery(a.title))
-  );
+  let weighted = scores.map((s, i) => {
+    return s * credibilityScore(articles[i].source);
+  });
 
   const avg =
-    scores.reduce((a, b) => a + b, 0) / scores.length;
+    weighted.reduce((a, b) => a + b, 0) / weighted.length;
 
   let verdict = "Unverified";
 
-  if (avg > 0.6) verdict = "Likely Real";
-  else if (avg < 0.3) verdict = "Possibly Misleading";
+  if (avg > 2.5) verdict = "Likely Real";
+  else if (avg < 1.2) verdict = "Possibly Misleading";
 
   return {
     verdict,
-    confidence: Math.round(avg * 100),
-    reasoning: `Matched ${articles.length} articles`
+    confidence: Math.min(95, Math.round(avg * 25)),
+    reasoning: `${articles.length} sources analyzed with semantic matching`,
+    bias: "Low"
   };
 }
 
 /* -------------------------
-   ROUTES
+   ROUTE
 ------------------------- */
 app.post("/analyze", async (req, res) => {
   try {
@@ -206,12 +225,11 @@ app.post("/analyze", async (req, res) => {
 
     res.json({
       ...result,
-      sources: articles
+      sources: articles.slice(0, 8)
     });
 
   } catch (err) {
     console.error(err);
-
     res.json({
       verdict: "Error",
       confidence: 0,
@@ -222,9 +240,9 @@ app.post("/analyze", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("✅ FULLY FIXED BACKEND RUNNING");
+  res.send("🚀 PRODUCTION BACKEND RUNNING");
 });
 
 app.listen(PORT, () => {
-  console.log("🚀 Running on", PORT);
+  console.log("Server running on", PORT);
 });

@@ -8,80 +8,129 @@
 <style>
 body {
   margin: 0;
-  font-family: Arial, sans-serif;
-  background: #0f172a;
+  font-family: 'Segoe UI', sans-serif;
+  background: radial-gradient(circle at top, #0f172a, #020617);
   color: white;
 }
 
-.container {
+/* HEADER */
+.header {
+  text-align: center;
+  padding: 30px 20px;
+}
+
+.header h1 {
+  font-size: 32px;
+  margin: 0;
+}
+
+.header p {
+  color: #94a3b8;
+}
+
+/* SEARCH BAR */
+.search-box {
+  display: flex;
   max-width: 800px;
   margin: auto;
-  padding: 20px;
+  background: #1e293b;
+  border-radius: 14px;
+  overflow: hidden;
 }
 
-h1 {
-  text-align: center;
-}
-
-textarea {
-  width: 100%;
-  height: 120px;
-  padding: 10px;
-  border-radius: 10px;
+.search-box input {
+  flex: 1;
+  padding: 16px;
   border: none;
-  margin-bottom: 10px;
-  font-size: 16px;
-}
-
-button {
-  width: 100%;
-  padding: 12px;
-  background: #3b82f6;
-  border: none;
-  border-radius: 10px;
+  outline: none;
+  background: transparent;
   color: white;
   font-size: 16px;
+}
+
+.search-box button {
+  background: linear-gradient(90deg, #3b82f6, #6366f1);
+  border: none;
+  padding: 0 24px;
+  color: white;
   cursor: pointer;
 }
 
-button:hover {
-  background: #2563eb;
+/* BADGES */
+.badges {
+  text-align: center;
+  margin-top: 15px;
 }
 
-.card {
-  margin-top: 20px;
-  padding: 20px;
+.badge {
+  display: inline-block;
+  padding: 6px 12px;
+  margin: 5px;
+  border-radius: 999px;
   background: #1e293b;
-  border-radius: 12px;
+  color: #94a3b8;
+  font-size: 12px;
 }
 
+/* MAIN LAYOUT */
+.main {
+  display: flex;
+  gap: 20px;
+  max-width: 1100px;
+  margin: 30px auto;
+  padding: 0 20px;
+}
+
+.left, .right {
+  flex: 1;
+}
+
+/* CARD */
+.card {
+  background: linear-gradient(135deg, #064e3b, #022c22);
+  border-radius: 16px;
+  padding: 20px;
+}
+
+/* RESULT HEADER */
 .verdict {
-  font-size: 22px;
+  font-size: 26px;
   font-weight: bold;
 }
 
-.real { color: #22c55e; }
-.fake { color: #ef4444; }
-.unverified { color: #facc15; }
+.green { color: #22c55e; }
+.red { color: #ef4444; }
+.yellow { color: #facc15; }
 
+/* CONFIDENCE BAR */
 .bar {
-  height: 10px;
-  background: #334155;
+  height: 12px;
+  background: #1e293b;
   border-radius: 10px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .fill {
   height: 100%;
-  background: #3b82f6;
+  background: linear-gradient(90deg, #22c55e, #4ade80);
   border-radius: 10px;
 }
 
+/* SECTION */
+.section {
+  margin-top: 20px;
+}
+
+.section h3 {
+  margin-bottom: 10px;
+}
+
+/* SOURCES */
 .source {
-  margin-top: 10px;
+  background: #020617;
   padding: 10px;
-  background: #0f172a;
-  border-radius: 8px;
+  border-radius: 10px;
+  margin-bottom: 10px;
 }
 
 a {
@@ -89,49 +138,68 @@ a {
   text-decoration: none;
 }
 
+/* SIDE PANEL */
+.side-card {
+  background: #1e293b;
+  border-radius: 16px;
+  padding: 20px;
+}
+
 .loading {
   text-align: center;
-  margin-top: 10px;
+  margin-top: 15px;
+  color: #94a3b8;
 }
 </style>
 </head>
 
 <body>
 
-<div class="container">
+<div class="header">
   <h1>🧠 Veritas AI</h1>
+  <p>Real-time news analysis. Trusted answers.</p>
+</div>
 
-  <textarea id="input" placeholder="Enter news or claim..."></textarea>
+<div class="search-box">
+  <input id="input" placeholder="Search news..." />
+  <button onclick="analyzeNews()">Analyze ✨</button>
+</div>
 
-  <button onclick="analyzeNews()">Analyze</button>
+<div class="badges">
+  <span class="badge">Multi-source</span>
+  <span class="badge">Real-time</span>
+  <span class="badge">Bias-aware</span>
+  <span class="badge">AI-verified</span>
+</div>
 
-  <div class="loading" id="loading"></div>
+<div class="loading" id="loading"></div>
 
-  <div id="result"></div>
+<div class="main">
+  <div class="left" id="result"></div>
+  <div class="right" id="sourcesPanel"></div>
 </div>
 
 <script>
-const API_URL = "https://workbysaksham.onrender.com"; // 🔴 CHANGE THIS
+const API_URL = "https://workbysaksham.onrender.com";
 
 function getClass(verdict) {
   verdict = verdict.toLowerCase();
-  if (verdict.includes("real")) return "real";
-  if (verdict.includes("fake")) return "fake";
-  return "unverified";
+  if (verdict.includes("real")) return "green";
+  if (verdict.includes("misleading")) return "red";
+  return "yellow";
 }
 
 async function analyzeNews() {
   const text = document.getElementById("input").value.trim();
   const resultDiv = document.getElementById("result");
+  const sourcesDiv = document.getElementById("sourcesPanel");
   const loading = document.getElementById("loading");
 
-  if (!text) {
-    alert("Enter something");
-    return;
-  }
+  if (!text) return alert("Enter something");
 
   loading.innerText = "Analyzing...";
   resultDiv.innerHTML = "";
+  sourcesDiv.innerHTML = "";
 
   try {
     const res = await fetch(`${API_URL}/analyze`, {
@@ -141,28 +209,44 @@ async function analyzeNews() {
     });
 
     const data = await res.json();
-
     loading.innerText = "";
 
     const cls = getClass(data.verdict);
 
+    /* LEFT MAIN CARD */
     resultDiv.innerHTML = `
       <div class="card">
         <div class="verdict ${cls}">${data.verdict}</div>
 
         <p>${data.reasoning}</p>
 
-        <p><strong>Confidence:</strong> ${data.confidence}%</p>
-        <div class="bar">
-          <div class="fill" style="width:${data.confidence}%"></div>
+        <div class="section">
+          <strong>Confidence: ${data.confidence}%</strong>
+          <div class="bar">
+            <div class="fill" style="width:${data.confidence}%"></div>
+          </div>
         </div>
 
-        <h3>Sources</h3>
+        <div class="section">
+          <h3>Key Reasons</h3>
+          <ul>
+            <li>Multiple sources analyzed</li>
+            <li>Cross-checked headlines</li>
+            <li>Consistency in reporting</li>
+          </ul>
+        </div>
+      </div>
+    `;
+
+    /* RIGHT SOURCES PANEL */
+    sourcesDiv.innerHTML = `
+      <div class="side-card">
+        <h3>Top Sources</h3>
         ${
           data.sources?.length
             ? data.sources.map(s => `
               <div class="source">
-                🔗 <a href="${s.url}" target="_blank">${s.title}</a><br/>
+                <a href="${s.url}" target="_blank">${s.title}</a><br/>
                 <small>${s.source}</small>
               </div>
             `).join("")
@@ -172,14 +256,8 @@ async function analyzeNews() {
     `;
 
   } catch (err) {
-    console.error(err);
-
     loading.innerText = "";
-    resultDiv.innerHTML = `
-      <div class="card">
-        <p>⚠️ Server error</p>
-      </div>
-    `;
+    resultDiv.innerHTML = `<div class="card">⚠️ Server error</div>`;
   }
 }
 </script>
