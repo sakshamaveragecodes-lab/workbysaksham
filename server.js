@@ -10,148 +10,117 @@ app.use(cors());
 app.use(express.json());
 
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
-const MEDIASTACK_API_KEY = process.env.MEDIASTACK_API_KEY;
-const HF_API_KEY = process.env.HF_API_KEY;
 
 /* -------------------------
-   GLOBAL SAFETY (NO CRASH)
+   CLEAN QUERY
 ------------------------- */
-process.on("uncaughtException", err => {
-  console.error("UNCAUGHT:", err);
-});
-
-process.on("unhandledRejection", err => {
-  console.error("UNHANDLED:", err);
-});
+function cleanQuery(text) {
+  return text
+    .replace(/[^a-zA-Z0-9 ]/g, "")
+    .split(" ")
+    .slice(0, 8)
+    .join(" ");
+}
 
 /* -------------------------
-   FETCH NEWS (SAFE)
+   FETCH NEWS
 ------------------------- */
 async function fetchNews(text) {
   try {
-    const query = text.split(" ").slice(0, 5).join(" ");
+    const query = cleanQuery(text);
 
-    const [gnews, mediastack] = await Promise.all([
-      fetch(`https://gnews.io/api/v4/search?q=${query}&max=5&lang=en&apikey=${GNEWS_API_KEY}`)
-        .then(r => r.json())
-        .then(d => d.articles || [])
-        .catch(() => []),
+    const res = await fetch(
+      `https://gnews.io/api/v4/search?q=${query}&max=10&lang=en&apikey=${GNEWS_API_KEY}`
+    );
 
-      fetch(`https://api.mediastack.com/v1/news?access_key=${MEDIASTACK_API_KEY}&keywords=${query}&limit=5`)
-        .then(r => r.json())
-        .then(d => d.data || [])
-        .catch(() => [])
-    ]);
+    const data = await res.json();
 
-    return [
-      ...gnews.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source?.name || "Unknown"
-      })),
-      ...mediastack.map(a => ({
-        title: a.title,
-        url: a.url,
-        source: a.source
-      }))
-    ];
+    return (data.articles || []).map(a => ({
+      title: a.title,
+      url: a.url,
+      source: a.source?.name || "Unknown"
+    }));
+
   } catch {
     return [];
   }
 }
 
 /* -------------------------
-   AI CHECK (SAFE)
+   SIMILARITY (JACCARD)
 ------------------------- */
-async function aiCheck(text, articles) {
-  if (!HF_API_KEY) return null;
+function similarity(a, b) {
+  a = a.toLowerCase();
+  b = b.toLowerCase();
 
-  const context = articles
-    .slice(0, 4)
-    .map(a => a.title)
-    .join("\n");
+  const wordsA = new Set(a.split(" "));
+  const wordsB = new Set(b.split(" "));
 
-  const prompt = `
-Fact check:
-"${text}"
+  const intersection = [...wordsA].filter(x => wordsB.has(x)).length;
+  const union = new Set([...wordsA, ...wordsB]).size;
 
-Based on:
-${context}
-
-Return JSON:
-{
- "verdict": "",
- "confidence": number,
- "reasoning": ""
-}
-`;
-
-  try {
-    const res = await fetch(
-      "https://api-inference.huggingface.co/models/google/flan-t5-large",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${HF_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ inputs: prompt })
-      }
-    );
-
-    const data = await res.json();
-    const output = data[0]?.generated_text;
-
-    try {
-      return JSON.parse(output);
-    } catch {
-      return null;
-    }
-
-  } catch {
-    return null;
-  }
+  return union === 0 ? 0 : intersection / union;
 }
 
 /* -------------------------
-   FALLBACK (ALWAYS WORKS)
+   TRUSTED SOURCES
 ------------------------- */
-function fallback(articles) {
-  if (articles.length === 0) {
+function isTrusted(source = "") {
+  const s = source.toLowerCase();
+
+  return [
+    "bbc",
+    "reuters",
+    "ap",
+    "the hindu",
+    "indian express",
+    "guardian",
+    "al jazeera"
+  ].some(x => s.includes(x));
+}
+
+/* -------------------------
+   ANALYSIS ENGINE
+------------------------- */
+function analyzeTruth(input, articles) {
+  if (!articles.length) {
     return {
       verdict: "Unverified",
       confidence: 20,
-      reasoning: "No sources found"
+      reasoning: "No strong news coverage found"
     };
   }
 
-  const trusted = articles.some(a =>
-    ["bbc","reuters","ap","the hindu"]
-      .some(s => a.source?.toLowerCase().includes(s))
-  );
+  const top = articles.slice(0, 5);
+
+  let similarityScore = 0;
+  let trustedCount = 0;
+
+  for (let a of top) {
+    similarityScore += similarity(input, a.title);
+
+    if (isTrusted(a.source)) trustedCount++;
+  }
+
+  similarityScore /= top.length;
+
+  const trustRatio = trustedCount / top.length;
+
+  const finalScore =
+    similarityScore * 0.6 +
+    trustRatio * 0.4;
+
+  let verdict = "Unverified";
+
+  if (finalScore > 0.7) verdict = "Likely Real";
+  else if (finalScore < 0.3) verdict = "Possibly Misleading";
 
   return {
-    verdict: trusted ? "Likely Real" : "Unverified",
-    confidence: trusted ? 65 : 40,
-    reasoning: trusted
-      ? "Reported by trusted sources"
-      : "Limited coverage"
-  };
-}
-
-/* -------------------------
-   ANALYZE
-------------------------- */
-async function analyze(text) {
-  const articles = await fetchNews(text);
-
-  const ai = await aiCheck(text, articles);
-
-  const result = ai && ai.verdict ? ai : fallback(articles);
-
-  return {
-    ...result,
-    sources: articles.slice(0, 5)
+    verdict,
+    confidence: Math.round(finalScore * 100),
+    reasoning:
+      `Similarity: ${(similarityScore * 100).toFixed(0)}%, ` +
+      `Trusted sources: ${trustedCount}/${top.length}`
   };
 }
 
@@ -159,7 +128,7 @@ async function analyze(text) {
    ROUTES
 ------------------------- */
 app.get("/", (req, res) => {
-  res.send("🚀 Server running stable");
+  res.send("🚀 Accuracy Improved Backend Running");
 });
 
 app.post("/analyze", async (req, res) => {
@@ -170,17 +139,21 @@ app.post("/analyze", async (req, res) => {
       return res.json({
         verdict: "Unverified",
         confidence: 20,
-        reasoning: "No input",
+        reasoning: "No input provided",
         sources: []
       });
     }
 
-    const result = await analyze(text);
+    const articles = await fetchNews(text);
+    const result = analyzeTruth(text, articles);
 
-    res.json(result);
+    res.json({
+      ...result,
+      sources: articles.slice(0, 5)
+    });
 
   } catch (err) {
-    console.error("ERROR:", err);
+    console.error(err);
 
     res.json({
       verdict: "Unverified",
@@ -191,5 +164,9 @@ app.post("/analyze", async (req, res) => {
   }
 });
 
+/* ------------------------- */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Running on", PORT));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Running on", PORT);
+});
