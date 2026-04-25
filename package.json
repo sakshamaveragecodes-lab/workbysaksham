@@ -1,7 +1,7 @@
 {
   "name": "veritas-backend",
   "version": "1.0.0",
-  "description": "Fake news detection using GNews + Mediastack",
+  "description": "Hybrid news verification backend (V5)",
   "type": "module",
   "main": "server.js",
   "scripts": {
